@@ -71,20 +71,20 @@ if [[ $PYTHON == 3.6 ]]; then
   conda install -c conda-forge -c defaults contextvars
 fi
 
-if [[ $PYTHON == 3.8 ]]; then
-    # Install pytorch to run related tests
-    conda install -c pytorch -c conda-forge -c defaults pytorch torchvision
-fi
-
-if [[ $PYTHON != 3.8 ]]; then
+if [[ $PYTHON <= 3.7 ]]; then
     # Install backport package for pickle protocol 5 support
     conda install -c conda-forge -c defaults 'pickle5>=0.0.11'
-    # stacktrace is not currently avaiable for Python 3.8.
-    # Remove the version check block below when it is avaiable.
+    # stacktrace is not currently avaiable for Python 3.8-3.9.
+    # Remove the version check block below when it is available.
     # For low-level profiler, install libunwind and stacktrace from conda-forge
     # For stacktrace we use --no-deps to avoid upgrade of python
     conda install -c conda-forge -c defaults libunwind
     conda install --no-deps -c conda-forge -c defaults -c numba stacktrace
+fi
+
+if [[ $PYTHON == 3.9 ]]; then
+    # Install pytorch to run related tests
+    conda install -c pytorch -c conda-forge -c defaults pytorch torchvision
 fi
 
 python -m pip install -q git+https://github.com/dask/dask.git --upgrade --no-deps
