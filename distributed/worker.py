@@ -519,6 +519,9 @@ class Worker(ServerNode):
             nthreads = ncores
 
         self.nthreads = nthreads or CPU_COUNT
+        if resources is None:
+            resources = dask.config.get("distributed.worker.resources", None)
+
         self.total_resources = resources or {}
         self.available_resources = (resources or {}).copy()
         self.death_timeout = parse_timedelta(death_timeout)
@@ -3007,7 +3010,7 @@ class Worker(ServerNode):
                     assert (
                         ts_wait.state == "flight"
                         or ts_wait.state == "waiting"
-                        or ts.wait.key in self._missing_dep_flight
+                        or ts_wait.key in self._missing_dep_flight
                         or ts_wait.who_has.issubset(self.in_flight_workers)
                     )
                 if ts.state == "memory":
