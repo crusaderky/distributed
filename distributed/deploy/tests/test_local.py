@@ -463,7 +463,7 @@ async def test_scale_up_and_down():
     strict=True,
 )
 @pytest.mark.skipif(
-    sys.version_info >= (3, 9), reason="Hangs forever on Python 3.9; reason unknown"
+    sys.version_info >= (3, 9), reason="Hangs on Python 3.9; reason unknown"
 )
 def test_silent_startup():
     code = """if 1:
