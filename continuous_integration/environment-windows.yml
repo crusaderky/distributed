@@ -4,7 +4,7 @@ channels:
   - defaults
 dependencies:
   - zstandard
-  - bokeh!=2.0.0
+  - bokeh
   - click
   - cloudpickle
   - cython
@@ -14,7 +14,7 @@ dependencies:
   - ipywidgets
   - joblib
   - jupyter_client
-  - msgpack-python>=0.6.0
+  - msgpack-python
   - prometheus_client
   - psutil
   - pytest

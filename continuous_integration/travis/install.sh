@@ -44,12 +44,12 @@ conda create -n dask-distributed -c conda-forge -c defaults \
     ipywidgets \
     joblib \
     jupyter_client \
-    'msgpack-python>=0.6.0' \
+    msgpack-python \
     netcdf4 \
     paramiko \
     prometheus_client \
     psutil \
-    'pytest>=4' \
+    pytest \
     'pytest-asyncio<0.14.0' \
     pytest-faulthandler \
     pytest-repeat \
@@ -59,7 +59,7 @@ conda create -n dask-distributed -c conda-forge -c defaults \
     scikit-learn \
     scipy \
     sortedcollections \
-    'tblib>=1.5.0' \
+    tblib \
     toolz \
     tornado=$TORNADO \
     zstandard \
