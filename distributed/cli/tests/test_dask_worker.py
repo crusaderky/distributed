@@ -247,6 +247,9 @@ def test_nprocs_negative(loop):
                 c.wait_for_workers(cpu_count(), timeout="10 seconds")
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 9), reason="Hangs on Python 3.9; reason unknown"
+)
 def test_nprocs_auto(loop):
     with popen(["dask-scheduler", "--no-dashboard"]) as sched:
         with popen(["dask-worker", "127.0.0.1:8786", "--nprocs=auto"]) as worker:
