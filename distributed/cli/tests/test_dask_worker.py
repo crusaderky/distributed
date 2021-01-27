@@ -41,7 +41,7 @@ def test_nanny_worker_ports(loop):
                     if d["workers"]:
                         break
                     else:
-                        assert time() - start < 5
+                        assert time() - start < 10
                         sleep(0.1)
                 assert (
                     d["workers"]["tcp://127.0.0.1:9684"]["nanny"]
@@ -73,7 +73,7 @@ def test_nanny_worker_port_range(loop):
                 start = time()
                 while len(c.scheduler_info()["workers"]) < nprocs:
                     sleep(0.1)
-                    assert time() - start < 5
+                    assert time() - start < 10
 
                 def get_port(dask_worker):
                     return dask_worker.port
