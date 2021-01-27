@@ -7,7 +7,7 @@
 
 # Set default variable values if unset
 # (useful when this script is not invoked by Travis)
-: ${PYTHON:=3.8}
+: ${PYTHON:=3.9}
 : ${TORNADO:=6}
 : ${PACKAGES:=python-snappy python-blosc}
 
@@ -71,7 +71,7 @@ if [[ $PYTHON == 3.6 ]]; then
   conda install -c conda-forge -c defaults contextvars
 fi
 
-if [[ $PYTHON <= 3.7 ]]; then
+if [[ $PYTHON < 3.8 ]]; then
     # Install backport package for pickle protocol 5 support
     conda install -c conda-forge -c defaults 'pickle5>=0.0.11'
     # stacktrace is not currently avaiable for Python 3.8-3.9.
