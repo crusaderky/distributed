@@ -1,4 +1,3 @@
-import importlib
 import traceback
 from array import array
 from enum import Enum
@@ -9,7 +8,7 @@ import msgpack
 import dask
 from dask.base import normalize_token
 
-from ..utils import ensure_bytes, has_keyword, typename
+from ..utils import ensure_bytes, has_keyword, import_allowed_module, typename
 from . import pickle
 from .compression import decompress, maybe_compress
 from .utils import frame_split_size, msgpack_opts, pack_frames_prelude, unpack_frames
@@ -18,8 +17,6 @@ lazy_registrations = {}
 
 dask_serialize = dask.utils.Dispatch("dask_serialize")
 dask_deserialize = dask.utils.Dispatch("dask_deserialize")
-
-_cached_allowed_modules = {}
 
 
 def dask_dumps(x, context=None):
@@ -83,27 +80,6 @@ def pickle_loads(header, frames):
         new.append(mv)
 
     return pickle.loads(x, buffers=new)
-
-
-def import_allowed_module(name):
-    if name in _cached_allowed_modules:
-        return _cached_allowed_modules[name]
-
-    # Check for non-ASCII characters
-    name = name.encode("ascii").decode()
-    # We only compare the root module
-    root = name.split(".", 1)[0]
-
-    # Note, if an empty string creeps into allowed-imports it is disallowed explicitly
-    if root and root in dask.config.get("distributed.scheduler.allowed-imports"):
-        _cached_allowed_modules[name] = importlib.import_module(name)
-        return _cached_allowed_modules[name]
-    else:
-        raise RuntimeError(
-            f"Importing {repr(name)} is not allowed, please add it to the list of "
-            "allowed modules the scheduler can import via the "
-            "distributed.scheduler.allowed-imports configuration setting."
-        )
 
 
 def msgpack_decode_default(obj):

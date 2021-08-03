@@ -27,6 +27,8 @@ from distributed.utils import (
     format_dashboard_link,
     get_ip_interface,
     get_traceback,
+    import_allowed_module,
+    import_term,
     is_kernel,
     is_valid_xml,
     nbytes,
@@ -584,3 +586,29 @@ def test_parse_timedelta_deprecated():
     with pytest.warns(FutureWarning, match="parse_timedelta is deprecated"):
         from distributed.utils import parse_timedelta
     assert parse_timedelta is dask.utils.parse_timedelta
+
+
+def test_import_allowed_module():
+    import concurrent.futures
+
+    import_allowed_module.cache_clear()
+    with pytest.raises(RuntimeError):
+        import_allowed_module("concurrent.futures")
+    # You only need set the top-level module in the config
+    with dask.config.set({"distributed.scheduler.allowed-imports": ["concurrent"]}):
+        assert import_allowed_module("concurrent.futures") is concurrent.futures
+    import_allowed_module.cache_clear()
+
+
+def test_import_term():
+    from concurrent.futures import Future
+
+    assert import_term("concurrent.futures.Future") is Future
+
+    import_allowed_module.cache_clear()
+    with pytest.raises(RuntimeError):
+        import_term("concurrent.futures.Future", allowed_only=True)
+    # You only need set the top-level module in the config
+    with dask.config.set({"distributed.scheduler.allowed-imports": ["concurrent"]}):
+        assert import_term("concurrent.futures.Future", allowed_only=True) is Future
+    import_allowed_module.cache_clear()

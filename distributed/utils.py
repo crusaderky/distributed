@@ -1332,20 +1332,45 @@ _offload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="Dask-O
 weakref.finalize(_offload_executor, _offload_executor.shutdown)
 
 
-def import_term(name: str):
+@functools.lru_cache(None)
+def import_allowed_module(name: str):
+    """Import a module, but only if the top-level package is explicitly listed in
+    ``distributed.scheduler.allowed-imports``
+    """
+    root = name.split(".", 1)[0]
+    if root in dask.config.get("distributed.scheduler.allowed-imports"):
+        return importlib.import_module(name)
+
+    raise RuntimeError(
+        f"Importing {name!r} is not allowed; please add it to the list of "
+        "allowed modules the scheduler can import via the "
+        "distributed.scheduler.allowed-imports configuration setting."
+    )
+
+
+def import_term(name: str, allowed_only: bool = False):
     """Return the fully qualified term
+
+    Parameters
+    ----------
+    allowed_only : bool, optional
+        If False (the default), allow importing from any module.
+        If True, only allow importing from top-level packages listed in
+        ``distributed.scheduler.allowed-imports``.
 
     Examples
     --------
     >>> import_term("math.sin") # doctest: +SKIP
     <function math.sin(x, /)>
     """
+    import_module = import_allowed_module if allowed_only else importlib.import_module
+
     try:
         module_name, attr_name = name.rsplit(".", 1)
     except ValueError:
-        return importlib.import_module(name)
+        return import_module(name)
 
-    module = importlib.import_module(module_name)
+    module = import_module(module_name)
     return getattr(module, attr_name)
 
 
