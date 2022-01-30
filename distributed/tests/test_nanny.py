@@ -616,10 +616,7 @@ async def test_environ_plugin(c, s, a, b):
 @pytest.mark.parametrize(
     "modname",
     [
-        pytest.param(
-            "numpy",
-            marks=pytest.mark.xfail(reason="distributed#5723, distributed#5729"),
-        ),
+        pytest.param("numpy", marks=pytest.mark.xfail(reason="distributed#5729")),
         "scipy",
         "pandas",
     ],
