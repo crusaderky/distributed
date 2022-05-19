@@ -4694,6 +4694,18 @@ class Scheduler(SchedulerState, ServerNode):
         self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
         self.send_all(client_msgs, worker_msgs)
 
+    def handle_missing_worker(
+        self, worker: str, errant_worker: str, stimulus_id: str
+    ) -> None:
+        """Signal that network comms to `errant_worker` failed."""
+        ws = self.workers.get(errant_worker)
+        if not ws:
+            return
+        for ts in ws.has_what:
+            self.handle_missing_data(ts.key, worker, errant_worker, stimulus_id)
+        # Let the missing worker a chance to reconnect later
+        self.remove_worker(worker, stimulus_id=stimulus_id, close=False)
+
     def handle_missing_data(
         self, key: str, worker: str, errant_worker: str, stimulus_id: str
     ) -> None:
