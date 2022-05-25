@@ -1,18 +1,18 @@
 import asyncio
 import logging
-from contextlib import contextmanager
 from itertools import chain
 
 import pytest
 
-from distributed import Worker
-from distributed.core import Status
+from distributed import Worker, wait
 from distributed.protocol.serialize import Serialize
 from distributed.utils import recursive_to_dict
 from distributed.utils_test import (
+    BlockedGetData,
     _LockedCommPool,
     assert_story,
     captured_logger,
+    freeze_data_fetching,
     gen_cluster,
     inc,
 )
@@ -256,23 +256,6 @@ def test_executefailure_to_dict():
     assert ev3.traceback_text == "tb text"
 
 
-@contextmanager
-def freeze_data_fetching(w: Worker):
-    """Prevent any task from transitioning from fetch to flight on the worker while
-    inside the context.
-
-    This is not the same as setting the worker to Status=paused, which would also
-    inform the Scheduler and prevent further tasks to be enqueued on the worker.
-    """
-    old_out_connections = w.total_out_connections
-    old_comm_threshold = w.comm_threshold_bytes
-    w.total_out_connections = 0
-    w.comm_threshold_bytes = 0
-    yield
-    w.total_out_connections = old_out_connections
-    w.comm_threshold_bytes = old_comm_threshold
-
-
 @gen_cluster(client=True)
 async def test_fetch_to_compute(c, s, a, b):
     with freeze_data_fetching(b):
@@ -335,7 +318,7 @@ async def test_lose_replica_during_fetch(c, s, w1, w2, w3, as_deps):
         2. x transitions released -> fetch
         3. the network stack is busy, so x does not transition to flight yet.
         4. scheduler calls handle_compute("y2", who_has={"x": [w3]}) on w1
-        5. when x finally reaches the top of the data_needed heap, the w1 will not try
+        5. when x finally reaches the top of the data_needed heap, w1 will not try
            contacting w2
 
     as_deps=False
@@ -343,13 +326,17 @@ async def test_lose_replica_during_fetch(c, s, w1, w2, w3, as_deps):
         2. x transitions released -> fetch
         3. the network stack is busy, so x does not transition to flight yet.
         4. scheduler calls handle_acquire_replicas(who_has={"x": [w3]}) on w1
-        5. when x finally reaches the top of the data_needed heap, the w1 will not try
+        5. when x finally reaches the top of the data_needed heap, w1 will not try
            contacting w2
     """
     x = (await c.scatter({"x": 1}, workers=[w2.address, w3.address], broadcast=True))[
         "x"
     ]
-    with freeze_data_fetching(w1):
+
+    # Make sure find_missing is not involved
+    w1.periodic_callbacks["find-missing"].stop()
+
+    with freeze_data_fetching(w1, jump_start=True):
         if as_deps:
             y1 = c.submit(inc, x, key="y1", workers=[w1.address])
         else:
@@ -371,13 +358,7 @@ async def test_lose_replica_during_fetch(c, s, w1, w2, w3, as_deps):
         while w1.tasks["x"].who_has != {w3.address}:
             await asyncio.sleep(0.01)
 
-    # Jump-start ensure_communicating after freeze_data_fetching.
-    # This simulates an unrelated third worker moving out of in_flight_workers.
-    w1.status = Status.paused
-    w1.status = Status.running
-
     await wait_for_state("x", "memory", w1)
-
     assert_story(
         w1.story("request-dep"),
         [("request-dep", w3.address, {"x"})],
@@ -421,20 +402,65 @@ async def test_fetch_to_missing(c, s, a, b):
         a.story("x"),
         [
             ("x", "ensure-task-exists", "released"),
-            ("x", "update-who-has", [b.address], []),
             ("x", "released", "fetch", "fetch", {}),
             ("gather-dependencies", b.address, {"x"}),
             ("x", "fetch", "flight", "flight", {}),
             ("request-dep", b.address, {"x"}),
             ("busy-gather", b.address, {"x"}),
             ("x", "flight", "fetch", "fetch", {}),
-            ("x", "update-who-has", [], [b.address]),  # Called Scheduler.who_has
             ("x", "fetch", "missing", "missing", {}),
         ],
         # There may be a round of find_missing() after this.
         # Due to timings, there also may be multiple attempts to connect from a to b.
         strict=False,
     )
+
+
+@pytest.mark.skip(reason="https://github.com/dask/distributed/issues/6446")
+@gen_cluster(client=True)
+async def test_new_replica_while_all_workers_in_flight(c, s, w1, w2):
+    """A task is stuck in 'fetch' state because all workers that hold a replica are in
+    flight. While in this state, a new replica appears on a different worker and the
+    scheduler informs the waiting worker through a new acquire-replicas or
+    compute-task op.
+
+    In real life, this will typically happen when the Active Memory Manager replicates a
+    key to multiple workers and some workers are much faster than others to acquire it,
+    due to unrelated tasks being in flight, so 2 seconds later the AMM reiterates the
+    request, passing a larger who_has.
+
+    Test that, when this happens, the task is immediately acquired from the new worker,
+    without waiting for the original replica holders to get out of flight.
+    """
+    # Make sure find_missing is not involved
+    w1.periodic_callbacks["find-missing"].stop()
+
+    async with BlockedGetData(s.address) as w3:
+        x = c.submit(inc, 1, key="x", workers=[w3.address])
+        y = c.submit(inc, 2, key="y", workers=[w3.address])
+        await wait([x, y])
+        s.request_acquire_replicas(w1.address, ["x"], stimulus_id="test")
+        await w3.in_get_data.wait()
+        assert w1.tasks["x"].state == "flight"
+        s.request_acquire_replicas(w1.address, ["y"], stimulus_id="test")
+        # This cannot progress beyond fetch because w3 is already in flight
+        await wait_for_state("y", "fetch", w1)
+
+        # Simulate that the AMM also requires that w2 acquires a replica of x.
+        # The replica lands on w2 soon afterwards, while w3->w1 comms remain blocked by
+        # unrelated transfers (x in our case).
+        w2.update_data({"y": 3}, report=True)
+        ws2 = s.workers[w2.address]
+        while ws2 not in s.tasks["y"].who_has:
+            await asyncio.sleep(0.01)
+
+        # 2 seconds later, the AMM reiterates that w1 should acquire a replica of y
+        s.request_acquire_replicas(w1.address, ["y"], stimulus_id="test")
+        await wait_for_state("y", "memory", w1)
+
+        # Finally let the other worker to get out of flight
+        w3.block_get_data.set()
+        await wait_for_state("x", "memory", w1)
 
 
 @gen_cluster(client=True, nthreads=[("", 1)])

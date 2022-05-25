@@ -1896,12 +1896,8 @@ class Worker(ServerNode):
             if ts.state != "memory":
                 recommendations[ts] = "fetch"
 
-        recommendations, instructions = merge_recs_instructions(
-            (recommendations, []),
-            self._update_who_has(who_has, stimulus_id=stimulus_id),
-        )
+        self._update_who_has(who_has)
         self.transitions(recommendations, stimulus_id=stimulus_id)
-        self._handle_instructions(instructions)
 
         if self.validate:
             for key in keys:
@@ -2004,10 +2000,7 @@ class Worker(ServerNode):
             for dep_key, value in nbytes.items():
                 self.tasks[dep_key].nbytes = value
 
-            recommendations, instructions = merge_recs_instructions(
-                (recommendations, instructions),
-                self._update_who_has(who_has, stimulus_id=stimulus_id),
-            )
+            self._update_who_has(who_has)
         else:  # pragma: nocover
             raise RuntimeError(f"Unexpected task state encountered {ts} {stimulus_id}")
 
@@ -2114,8 +2107,7 @@ class Worker(ServerNode):
             if dep_ts.state != "memory":
                 ts.waiting_for_data.add(dep_ts)
                 dep_ts.waiters.add(ts)
-                if dep_ts.state not in {"fetch", "flight"}:
-                    recommendations[dep_ts] = "fetch"
+                recommendations[dep_ts] = "fetch"
 
         if ts.waiting_for_data:
             self.waiting_for_data_count += 1
@@ -2702,7 +2694,7 @@ class Worker(ServerNode):
             assert not args
             finish, *args = finish  # type: ignore
 
-        if ts is None or ts.state == finish:
+        if ts.state == finish:
             return {}, []
 
         start = ts.state
@@ -3006,8 +2998,11 @@ class Worker(ServerNode):
             if ts.state != "fetch" or ts.key in all_keys_to_gather:
                 continue
 
+            if not ts.who_has:
+                recommendations[ts] = "missing"
+                continue
+
             if self.validate:
-                assert ts.who_has
                 assert self.address not in ts.who_has
 
             workers = [
@@ -3445,61 +3440,17 @@ class Worker(ServerNode):
             if ts.who_has == workers:
                 continue
 
-            new_workers = workers - ts.who_has
-            del_workers = ts.who_has - workers
-
-            def max2(workers: set[str]) -> list[str]:
-                if len(workers) < 3:
-                    return list(workers)
-                it = iter(workers)
-                return [next(it), next(it), f"({len(workers) - 2} more)"]
-
-            self.log.append(
-                (
-                    key,
-                    "update-who-has",
-                    max2(new_workers),
-                    max2(del_workers),
-                    stimulus_id,
-                    time(),
-                )
-            )
-
-            for worker in del_workers:
+            for worker in ts.who_has - workers:
                 self.has_what[worker].discard(key)
                 # Can't remove from self.data_needed_per_worker; there is logic
                 # in _select_keys_for_gather to deal with this
 
-            for worker in new_workers:
+            for worker in workers - ts.who_has:
                 self.has_what[worker].add(key)
                 if ts.state == "fetch":
                     self.data_needed_per_worker[worker].push(ts)
-                    # All workers which previously held a replica of the key may either
-                    # be in flight or busy. Kick off ensure_communicating to try
-                    # fetching the data from the new worker.
-                    # There are other reasons why a task may be sitting in 'fetch' state
-                    # - e.g. if we're over the total_out_connections or the
-                    # comm_threshold_bytes limit, or if we're paused. We're deliberately
-                    # NOT testing the full gamut of use cases for the sake of simplicity
-                    # and robustness and just stating that ensure_communicating *may*
-                    # return new GatherDep events now.
-                    instructions.append(
-                        EnsureCommunicatingAfterTransitions(stimulus_id=stimulus_id)
-                    )
 
             ts.who_has = workers
-            # currently fetching -> can no longer be fetched -> transition to missing
-            # currently missing -> opportunity to be fetched -> transition to fetch
-            # any other state -> eventually, possibly, the task may transition to fetch
-            # or missing, at which point the relevant transitions will test who_has that
-            # we just updated. e.g. see the various transitions to fetch, which
-            # instead recommend transitioning to missing if who_has is empty.
-            if not workers and ts.state == "fetch":
-                recs[ts] = "missing"
-            elif workers and ts.state == "missing":
-                recs[ts] = "fetch"
-
-        return recs, instructions
 
     def handle_steal_request(self, key: str, stimulus_id: str) -> None:
         # There may be a race condition between stealing and releasing a task.
@@ -4250,8 +4201,8 @@ class Worker(ServerNode):
         assert self.address not in ts.who_has
         assert not ts.done
         assert ts in self.data_needed
-        assert ts.who_has
-
+        # Note: ts.who_has may be have been emptied by _update_who_has, but the task
+        # won't transition to missing until it reaches the top of the data_needed heap.
         for w in ts.who_has:
             assert ts.key in self.has_what[w]
             assert ts in self.data_needed_per_worker[w]

@@ -4142,7 +4142,9 @@ class Scheduler(SchedulerState, ServerNode):
         return tuple(seen)
 
     @log_errors
-    async def remove_worker(self, address, stimulus_id, safe=False, close=True):
+    async def remove_worker(
+        self, address: str, *, stimulus_id: str, safe: bool = False, close: bool = True
+    ) -> Literal["OK", "already-removed"]:
         """
         Remove worker from cluster
 
@@ -4151,7 +4153,7 @@ class Scheduler(SchedulerState, ServerNode):
         state.
         """
         if self.status == Status.closed:
-            return
+            return "already-removed"
 
         address = self.coerce_address(address)
 
