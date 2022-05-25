@@ -2998,11 +2998,8 @@ class Worker(ServerNode):
             if ts.state != "fetch" or ts.key in all_keys_to_gather:
                 continue
 
-            if not ts.who_has:
-                recommendations[ts] = "missing"
-                continue
-
             if self.validate:
+                assert ts.who_has
                 assert self.address not in ts.who_has
 
             workers = [
@@ -4217,8 +4214,8 @@ class Worker(ServerNode):
         assert self.address not in ts.who_has
         assert not ts.done
         assert ts in self.data_needed
-        # Note: ts.who_has may be have been emptied by _update_who_has, but the task
-        # won't transition to missing until it reaches the top of the data_needed heap.
+        assert ts.who_has
+
         for w in ts.who_has:
             assert ts.key in self.has_what[w]
             assert ts in self.data_needed_per_worker[w]
