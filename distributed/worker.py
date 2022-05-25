@@ -815,8 +815,8 @@ class Worker(ServerNode):
             "compute-task": self.handle_compute_task,
             "free-keys": self.handle_free_keys,
             "remove-replicas": self.handle_remove_replicas,
-            "refresh-who-has": self.handle_refresh_who_has,
             "steal-request": self.handle_steal_request,
+            "refresh-who-has": self.handle_refresh_who_has,
             "worker-status-change": self.handle_worker_status_change,
         }
 
@@ -3355,7 +3355,7 @@ class Worker(ServerNode):
                 self.busy_workers.add(worker)
                 self.io_loop.call_later(0.15, self._readd_busy_worker, worker)
 
-            refresh_who_has = set()
+            refresh_who_has = []
 
             for d in self.in_flight_workers.pop(worker):
                 ts = self.tasks[d]
@@ -3365,7 +3365,7 @@ class Worker(ServerNode):
                 elif busy:
                     recommendations[ts] = "fetch"
                     if not ts.who_has - self.busy_workers:
-                        refresh_who_has.add(ts.key)
+                        refresh_who_has.append(d)
                 elif ts not in recommendations:
                     ts.who_has.discard(worker)
                     self.has_what[worker].discard(ts.key)
@@ -3384,7 +3384,7 @@ class Worker(ServerNode):
                 # Try querying the scheduler for unknown ones.
                 instructions.append(
                     RequestRefreshWhoHasMsg(
-                        keys=list(refresh_who_has),
+                        keys=refresh_who_has,
                         stimulus_id=f"gather-dep-busy-{time()}",
                     )
                 )
@@ -3408,12 +3408,7 @@ class Worker(ServerNode):
             "heartbeat"
         ].callback_time
 
-    def _update_who_has(
-        self, who_has: Mapping[str, Collection[str]], *, stimulus_id: str
-    ) -> RecsInstrs:
-        recs: Recs = {}
-        instructions: Instructions = []
-
+    def _update_who_has(self, who_has: Mapping[str, Collection[str]]) -> None:
         for key, workers in who_has.items():
             ts = self.tasks.get(key)
             if not ts:
@@ -3963,8 +3958,7 @@ class Worker(ServerNode):
             return {}, []
 
         if self.validate:
-            for ts in self._missing_dep_flight:
-                assert not ts.who_has
+            assert not any(ts.who_has for ts in self._missing_dep_flight)
 
         smsg = RequestRefreshWhoHasMsg(
             keys=[ts.key for ts in self._missing_dep_flight],
@@ -3974,7 +3968,29 @@ class Worker(ServerNode):
 
     @handle_event.register
     def _(self, ev: RefreshWhoHasEvent) -> RecsInstrs:
-        return self._update_who_has(ev.who_has, stimulus_id=ev.stimulus_id)
+        self._update_who_has(ev.who_has)
+        recommendations: Recs = {}
+        instructions: Instructions = []
+
+        for key in ev.who_has:
+            ts = self.tasks.get(key)
+            if not ts:
+                continue
+
+            if ts.who_has and ts.state == "missing":
+                recommendations[ts] = "fetch"
+            elif ts.who_has and ts.state == "fetch":
+                # We potentially just acquired new replicas whereas all previously known
+                # workers are in flight or busy. We're deliberately not testing the
+                # minute use cases here for the sake of simplicity; instead we rely on
+                # _ensure_communicating to be a no-op when there's nothing to do.
+                instructions.append(
+                    EnsureCommunicatingAfterTransitions(stimulus_id=ev.stimulus_id)
+                )
+            elif not ts.who_has and ts.state == "fetch":
+                recommendations[ts] = "missing"
+
+        return recommendations, instructions
 
     def _prepare_args_for_execution(
         self, ts: TaskState, args: tuple, kwargs: dict[str, Any]
