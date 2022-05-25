@@ -115,6 +115,7 @@ from distributed.worker_state_machine import (
     Execute,
     ExecuteFailureEvent,
     ExecuteSuccessEvent,
+    FindMissingEvent,
     GatherDep,
     GatherDepDoneEvent,
     Instructions,
@@ -123,7 +124,9 @@ from distributed.worker_state_machine import (
     MissingDataMsg,
     Recs,
     RecsInstrs,
+    RefreshWhoHasEvent,
     ReleaseWorkerDataMsg,
+    RequestRefreshWhoHasMsg,
     RescheduleEvent,
     RescheduleMsg,
     SendMessageToScheduler,
@@ -812,6 +815,7 @@ class Worker(ServerNode):
             "compute-task": self.handle_compute_task,
             "free-keys": self.handle_free_keys,
             "remove-replicas": self.handle_remove_replicas,
+            "refresh-who-has": self.handle_refresh_who_has,
             "steal-request": self.handle_steal_request,
             "worker-status-change": self.handle_worker_status_change,
         }
@@ -840,9 +844,7 @@ class Worker(ServerNode):
         )
         self.periodic_callbacks["keep-alive"] = pc
 
-        # FIXME annotations: https://github.com/tornadoweb/tornado/issues/3117
-        pc = PeriodicCallback(self.find_missing, 1000)  # type: ignore
-        self._find_missing_running = False
+        pc = PeriodicCallback(self.find_missing, 1000)
         self.periodic_callbacks["find-missing"] = pc
 
         self._address = contact_address
@@ -1835,6 +1837,13 @@ class Worker(ServerNode):
         self.transitions(recommendations, stimulus_id=stimulus_id)
 
         return "OK"
+
+    def handle_refresh_who_has(
+        self, who_has: dict[str, list[str]], stimulus_id: str
+    ) -> None:
+        self.handle_stimulus(
+            RefreshWhoHasEvent(who_has=who_has, stimulus_id=stimulus_id)
+        )
 
     async def set_resources(self, **resources) -> None:
         for r, quantity in resources.items():
@@ -2854,7 +2863,8 @@ class Worker(ServerNode):
 
     @log_errors
     def handle_stimulus(self, stim: StateMachineEvent) -> None:
-        self.stimulus_log.append(stim.to_loggable(handled=time()))
+        if not isinstance(stim, FindMissingEvent):
+            self.stimulus_log.append(stim.to_loggable(handled=time()))
         recs, instructions = self.handle_event(stim)
         self.transitions(recs, stimulus_id=stim.stimulus_id)
         self._handle_instructions(instructions)
@@ -3373,22 +3383,19 @@ class Worker(ServerNode):
                         )
                     )
                     recommendations[ts] = "fetch"
-            del data, response
-            self.transitions(recommendations, stimulus_id=stimulus_id)
-            self._handle_instructions(instructions)
 
             if refresh_who_has:
                 # All workers that hold known replicas of our tasks are busy.
                 # Try querying the scheduler for unknown ones.
-                who_has = await retry_operation(
-                    self.scheduler.who_has, keys=refresh_who_has
+                instructions.append(
+                    RequestRefreshWhoHasMsg(
+                        keys=list(refresh_who_has),
+                        stimulus_id=f"gather-dep-busy-{time()}",
+                    )
                 )
-                refresh_stimulus_id = f"gather-dep-busy-{time()}"
-                recommendations, instructions = self._update_who_has(
-                    who_has, stimulus_id=refresh_stimulus_id
-                )
-                self.transitions(recommendations, stimulus_id=refresh_stimulus_id)
-                self._handle_instructions(instructions)
+
+            self.transitions(recommendations, stimulus_id=stimulus_id)
+            self._handle_instructions(instructions)
 
     @log_errors
     def _readd_busy_worker(self, worker: str) -> None:
@@ -3398,36 +3405,13 @@ class Worker(ServerNode):
         )
 
     @log_errors
-    async def find_missing(self) -> None:
-        if self._find_missing_running or not self._missing_dep_flight:
-            return
-        try:
-            self._find_missing_running = True
-            if self.validate:
-                for ts in self._missing_dep_flight:
-                    assert not ts.who_has
+    def find_missing(self) -> None:
+        self.handle_stimulus(FindMissingEvent(stimulus_id=f"find-missing-{time()}"))
 
-            stimulus_id = f"find-missing-{time()}"
-            who_has = await retry_operation(
-                self.scheduler.who_has,
-                keys=[ts.key for ts in self._missing_dep_flight],
-            )
-            recommendations, instructions = self._update_who_has(
-                who_has, stimulus_id=stimulus_id
-            )
-            for ts in self._missing_dep_flight:
-                if ts.who_has:
-                    assert ts not in recommendations
-                    recommendations[ts] = "fetch"
-            self.transitions(recommendations, stimulus_id=stimulus_id)
-            self._handle_instructions(instructions)
-
-        finally:
-            self._find_missing_running = False
-            # This is quite arbitrary but the heartbeat has scaling implemented
-            self.periodic_callbacks[
-                "find-missing"
-            ].callback_time = self.periodic_callbacks["heartbeat"].callback_time
+        # This is quite arbitrary but the heartbeat has scaling implemented
+        self.periodic_callbacks["find-missing"].callback_time = self.periodic_callbacks[
+            "heartbeat"
+        ].callback_time
 
     def _update_who_has(
         self, who_has: Mapping[str, Collection[str]], *, stimulus_id: str
@@ -3505,12 +3489,15 @@ class Worker(ServerNode):
 
             ts.who_has = workers
             # currently fetching -> can no longer be fetched -> transition to missing
+            # currently missing -> opportunity to be fetched -> transition to fetch
             # any other state -> eventually, possibly, the task may transition to fetch
             # or missing, at which point the relevant transitions will test who_has that
             # we just updated. e.g. see the various transitions to fetch, which
             # instead recommend transitioning to missing if who_has is empty.
             if not workers and ts.state == "fetch":
                 recs[ts] = "missing"
+            elif workers and ts.state == "missing":
+                recs[ts] = "fetch"
 
         return recs, instructions
 
@@ -4018,6 +4005,25 @@ class Worker(ServerNode):
         ts = self.tasks.get(ev.key)
         assert ts, self.story(ev.key)
         return {ts: "rescheduled"}, []
+
+    @handle_event.register
+    def _(self, ev: FindMissingEvent) -> RecsInstrs:
+        if not self._missing_dep_flight:
+            return {}, []
+
+        if self.validate:
+            for ts in self._missing_dep_flight:
+                assert not ts.who_has
+
+        smsg = RequestRefreshWhoHasMsg(
+            keys=[ts.key for ts in self._missing_dep_flight],
+            stimulus_id=ev.stimulus_id,
+        )
+        return {}, [smsg]
+
+    @handle_event.register
+    def _(self, ev: RefreshWhoHasEvent) -> RecsInstrs:
+        return self._update_who_has(ev.who_has, stimulus_id=ev.stimulus_id)
 
     def _prepare_args_for_execution(
         self, ts: TaskState, args: tuple, kwargs: dict[str, Any]
