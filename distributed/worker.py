@@ -3973,6 +3973,7 @@ class Worker(ServerNode):
         self._update_who_has(ev.who_has)
         recommendations: Recs = {}
         instructions: Instructions = []
+        ensure_communicating = False
 
         for key in ev.who_has:
             ts = self.tasks.get(key)
@@ -3986,11 +3987,15 @@ class Worker(ServerNode):
                 # workers are in flight or busy. We're deliberately not testing the
                 # minute use cases here for the sake of simplicity; instead we rely on
                 # _ensure_communicating to be a no-op when there's nothing to do.
-                instructions.append(
-                    EnsureCommunicatingAfterTransitions(stimulus_id=ev.stimulus_id)
-                )
+                ensure_communicating = True
             elif not ts.who_has and ts.state == "fetch":
                 recommendations[ts] = "missing"
+
+        if ensure_communicating:
+            recommendations, instructions = merge_recs_instructions(
+                (recommendations, instructions),
+                self._ensure_communicating(stimulus_id=ev.stimulus_id),
+            )
 
         return recommendations, instructions
 
