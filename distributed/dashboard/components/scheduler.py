@@ -3505,7 +3505,7 @@ class WorkerTable(DashboardComponent):
         "in_memory",
         "ready",
         "time",
-        "spilled_nbytes",
+        "spill",
     }
 
     def __init__(self, scheduler, width=800, **kwargs):

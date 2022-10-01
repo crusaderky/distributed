@@ -85,6 +85,9 @@ class SpillBuffer(zict.Buffer):
     last_logged: float
     min_log_interval: float
     logged_pickle_errors: set[str]
+    # Total number of read accesses (to either fast or slow)
+    # See also: Slow.read_count_total
+    read_count_total: int
 
     def __init__(
         self,
@@ -107,6 +110,11 @@ class SpillBuffer(zict.Buffer):
         self.last_logged = 0
         self.min_log_interval = min_log_interval
         self.logged_pickle_errors = set()  # keys logged with pickle error
+        self.read_count_total = 0
+
+    def __getitem__(self, key: str) -> Any:
+        self.read_count_total += 1
+        return super().__getitem__(key)
 
     @contextmanager
     def handle_errors(self, key: str | None) -> Iterator[None]:
@@ -230,18 +238,35 @@ class SpillBuffer(zict.Buffer):
         """
         return self.slow
 
-    @property
-    def spilled_total(self) -> SpilledSize:
-        """Number of bytes spilled to disk. Tuple of
+    def get_metrics(self) -> dict[str, int]:
+        """Generate useful metrics:
 
-        - output of sizeof()
-        - pickled size
-
-        The two may differ substantially, e.g. if sizeof() is inaccurate or in case of
-        compression.
+        spilled_bytes_memory
+            sum of the output of sizeof() for all keys spilled to disk
+        spilled_bytes_disk
+            sum of pickled sizes of all keys spilled to disk.
+            It may differ substantially from spilled_bytes_memory, e.g. if sizeof() is
+            inaccurate or in case of compression.
+        cache_hits
+            Ever-increasing number of keys read from memory so far
+            This metric is ever-increasing.
+        cache_misses
+            Ever-increasing number of keys read from disk so far
+        disk_read_bytes_total
+            Ever-increasing number of bytes read from disk so far
+        disk_write_bytes_total
+            Ever-increasing number of bytes written to disk so far
         """
         slow = cast(zict.Cache, self.slow).data if has_zict_220 else self.slow
-        return cast(Slow, slow).total_weight
+        assert isinstance(slow, Slow)
+        return {
+            "spilled_bytes_memory": slow.total_weight.memory,
+            "spilled_bytes_disk": slow.total_weight.disk,
+            "cache_hits": self.read_count_total - slow.read_count_total,
+            "cache_misses": slow.read_count_total,
+            "disk_read_bytes_total": slow.read_bytes_total,
+            "disk_write_bytes_total": slow.write_bytes_total,
+        }
 
 
 def _in_memory_weight(key: str, value: Any) -> int:
@@ -267,6 +292,12 @@ class Slow(zict.Func):
     weight_by_key: dict[str, SpilledSize]
     total_weight: SpilledSize
 
+    # Counters
+    read_count_total: int
+    write_count_total: int
+    read_bytes_total: int
+    write_bytes_total: int
+
     def __init__(self, spill_directory: str, max_weight: int | Literal[False] = False):
         super().__init__(
             partial(serialize_bytelist, on_error="raise"),
@@ -276,6 +307,16 @@ class Slow(zict.Func):
         self.max_weight = max_weight
         self.weight_by_key = {}
         self.total_weight = SpilledSize(0, 0)
+
+        self.read_count_total = 0
+        self.read_bytes_total = 0
+        self.write_count_total = 0
+        self.write_bytes_total = 0
+
+    def __getitem__(self, key: str) -> Any:
+        self.read_count_total += 1
+        self.read_bytes_total += self.weight_by_key[key].disk
+        return super().__getitem__(key)
 
     def __setitem__(self, key: str, value: Any) -> None:
         try:
@@ -316,6 +357,9 @@ class Slow(zict.Func):
         weight = SpilledSize(safe_sizeof(value), pickled_size)
         self.weight_by_key[key] = weight
         self.total_weight += weight
+
+        self.write_count_total += 1
+        self.write_bytes_total += weight.disk
 
     def __delitem__(self, key: str) -> None:
         super().__delitem__(key)

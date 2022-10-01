@@ -982,10 +982,9 @@ class Worker(BaseWorker, ServerNode):
 
     async def get_metrics(self) -> dict:
         try:
-            spilled_memory, spilled_disk = self.data.spilled_total  # type: ignore
+            spill_metrics = self.data.get_metrics()  # type: ignore
         except AttributeError:
-            # spilling is disabled
-            spilled_memory, spilled_disk = 0, 0
+            spill_metrics = {}
 
         out = dict(
             executing=self.state.executing_count,
@@ -997,10 +996,7 @@ class Worker(BaseWorker, ServerNode):
                 "workers": dict(self.bandwidth_workers),
                 "types": keymap(typename, self.bandwidth_types),
             },
-            spilled_nbytes={
-                "memory": spilled_memory,
-                "disk": spilled_disk,
-            },
+            spill=spill_metrics,
             transfer={
                 "incoming_bytes": self.state.transfer_incoming_bytes,
                 "incoming_count": self.state.transfer_incoming_count,

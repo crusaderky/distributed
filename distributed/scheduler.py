@@ -573,9 +573,10 @@ class WorkerState:
             process=self.metrics["memory"] or 0,
             # self.nbytes is instantaneous; metrics may lag behind by a heartbeat
             managed_in_memory=max(
-                0, self.nbytes - self.metrics["spilled_nbytes"]["memory"]
+                0,
+                self.nbytes - self.metrics["spill"].get("spilled_bytes_memory", 0),
             ),
-            managed_spilled=self.metrics["spilled_nbytes"]["disk"],
+            managed_spilled=self.metrics["spill"].get("spilled_bytes_disk", 0),
             unmanaged_old=self._memory_unmanaged_old,
         )
 
@@ -3920,7 +3921,9 @@ class Scheduler(SchedulerState, ServerNode):
         # so size may be (temporarily) negative; floor it to zero.
         size = max(
             0,
-            (metrics["memory"] or 0) - ws.nbytes + metrics["spilled_nbytes"]["memory"],
+            (metrics["memory"] or 0)
+            - ws.nbytes
+            + metrics["spill"].get("spilled_bytes_memory", 0),
         )
 
         ws._memory_unmanaged_history.append((local_now, size))
