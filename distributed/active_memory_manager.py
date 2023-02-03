@@ -7,9 +7,11 @@ spill/pause/terminate mechanics on the Worker side.
 from __future__ import annotations
 
 import abc
+import heapq
 import logging
+import math
 from collections import defaultdict
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import dask
@@ -522,7 +524,7 @@ class ReduceReplicas(ActiveMemoryManagerPolicy):
         ndrop = 0
 
         for ts in self.manager.scheduler.replicated_tasks:
-            desired_replicas = 1  # TODO have a marker on TaskState
+            desired_replicas = ts.annotations.get("replicate", 1)
 
             # If a dependent task has not been assigned to a worker yet, err on the side
             # of caution and preserve an additional replica for it.
@@ -718,3 +720,235 @@ class RetireWorker(ActiveMemoryManagerPolicy):
         if ws is None:
             return True
         return all(len(ts.who_has) > 1 for ts in ws.has_what)
+
+
+class Replicate(ActiveMemoryManagerPolicy):
+    """Make sure that the number of replicas for a key is, at all times, at least what
+    the user asked for through ``Client.replicate()`` or ``Client.scatter(...,
+    broadcast=True)``. Only the keys that have been listed in one of the above two
+    methods have this policy attached to them. If a user later invokes
+    ``Client.replicate(..., 1)``, this policy will be automatically detached at the next
+    iteration of the Active Memory Manager.
+    """
+
+    __slots__ = ("key",)
+    key: str
+
+    def __init__(self, key: str):
+        self.key = key
+
+    def __repr__(self) -> str:
+        return f"Replicate({self.key})"
+
+    def run(self) -> SuggestionGenerator:
+        ts = self.manager.scheduler.tasks.get(self.key)
+        desired_replicas = ts.annotations.get("replicate", 1) if ts else 1
+        if ts is None or desired_replicas == 1:
+            self.manager.policies.remove(self)
+            return
+
+        if not ts.who_has:
+            return
+
+        try:
+            pending_repl, pending_drop = self.manager.pending[ts]
+            npending = len(pending_repl) - len(pending_drop)
+        except KeyError:
+            npending = 0
+        nrepl = desired_replicas - len(ts.who_has) - npending
+        for _ in range(nrepl):
+            yield Suggestion("replicate", ts)
+
+
+class Rebalance(ActiveMemoryManagerPolicy):
+    """Identify workers that need to lose keys and those that can receive them, together
+    with how many bytes each needs to lose/receive. Then, send the key to the Active
+    Memory Manager together with a shortlist of receivers, requiring replication
+    somewhere else.
+
+    To reiterate: in order to *reduce* memory pressure, this policy *increases* the
+    number of key replicas. In the next iteration of the Active Memory Manager, the
+    ReduceReplicas policy will spot that the key has excessive replicas and delete the
+    one from the worker with the worst memory situation, which will be likely, but not
+    necessarily, the same one this policy identified.
+
+    **Algorithm**
+
+    #. Find the mean memory occupancy of the cluster
+    #. Discard workers whose occupancy is within 5% of the mean cluster occupancy
+       (``sender_recipient_gap`` / 2).
+       This helps avoid data from bouncing around the cluster repeatedly.
+    #. Workers above the mean are senders; those below are recipients.
+    #. Discard senders whose absolute occupancy is below 30% (``sender_min``).
+       In other words, no data is moved regardless of imbalancing as long as all workers
+       are below 30%.
+    #. Discard recipients whose absolute occupancy is above 60% (``recipient_max``).
+       Note that this threshold by default is the same as
+       ``distributed.worker.memory.target`` to prevent workers from accepting data
+       and immediately spilling it out to disk.
+    #. Iteratively pick the sender and recipient that are farthest from the mean and
+       move the *least recently inserted* key between the two, until either all senders
+       or all recipients fall within 5% of the mean.
+
+       A recipient will be skipped if it already has a copy of the data. In other words,
+       this method does not degrade replication.
+       A key will be skipped if there are no recipients available with enough memory to
+       accept the key and that don't already hold a copy.
+
+    The least recently insertd (LRI) policy is a greedy choice with the advantage of
+    being O(1), trivial to implement (it relies on python dict insertion-sorting) and
+    hopefully good enough in most cases. Discarded alternative policies were:
+
+    - Largest first. O(n*log(n)) save for non-trivial additional data structures and
+      risks causing the largest chunks of data to repeatedly move around the
+      cluster like pinballs.
+    - Least recently used (LRU). This information is currently available on the
+      workers only and not trivial to replicate on the scheduler; transmitting it
+      over the network would be very expensive. Also, note that dask will go out of
+      its way to minimise the amount of time intermediate keys are held in memory,
+      so in such a case LRI is a close approximation of LRU.
+
+    **Complexity**
+
+    The big-O complexity is ``O(wt + ke*log(ws)*wr)``, where
+
+    - wt is the total number of workers on the cluster
+    - ke is the number of keys that need to be moved in order to achieve a balanced
+      cluster
+    - ws is the number of workers that are eligible to be senders
+    - wr is the number of workers that are eligible to be recipients
+    - kt is the total number of keys on the cluster, and it's not part of the equation.
+
+    There is however a degenerate edge case ``O(wt + kt*log(ws)*wr)`` when most keys are
+    either replicated or cannot be moved for some other reason.
+    """
+
+    __slots__ = ("sender_min", "recipient_max", "half_gap")
+
+    sender_min: float
+    recipient_max: float
+    half_gap: float
+
+    def __init__(
+        self, sender_min: float, recipient_max: float, sender_recipient_gap: float
+    ):
+        self.sender_min = sender_min
+        self.recipient_max = recipient_max
+        self.half_gap = sender_recipient_gap / 2.0
+
+    def run(self) -> SuggestionGenerator:
+        # Heap of workers, managed by the heapq module, that need to send data, with how
+        # many bytes each needs to send.
+        #
+        # Each element of the heap is a tuple constructed as follows:
+        # - bytes_max: maximum number of bytes to send or receive.
+        #   This number is negative, so that the workers farthest from the cluster mean
+        #   are at the top of the smallest-first heaps.
+        # - bytes_min: minimum number of bytes after sending/receiving which the worker
+        #   should not be considered anymore. This is also negative.
+        # - arbitrary unique number, there just to make sure that WorkerState objects
+        #   are never used for sorting in the unlikely event that two processes have
+        #   exactly the same number of bytes allocated.
+        # - WorkerState
+        # - iterator of all tasks in memory on the worker, insertion sorted (least
+        #   recently inserted first). Note that this iterator will typically *not* be
+        #   exhausted. It will only be exhausted if, after moving away from the worker
+        #   all keys that can be moved, is insufficient to drop snd_bytes_min above 0.
+        senders: list[tuple[int, int, int, WorkerState, Iterator[TaskState]]] = []
+
+        # Workers that can receive data, each mapped to the memory threshold that, once
+        # crossed, will cause them to be expunged from the dict
+        recipients: dict[WorkerState, int] = {}
+
+        mean_memory = sum(self.manager.workers_memory.values()) // len(
+            self.manager.workers_memory
+        )
+
+        for ws, ws_memory in self.manager.workers_memory.items():
+            if ws.memory_limit:
+                half_gap = int(self.half_gap * ws.memory_limit)
+                sender_min = self.sender_min * ws.memory_limit
+                recipient_max = self.recipient_max * ws.memory_limit
+            else:
+                half_gap = 0
+                sender_min = 0.0
+                recipient_max = math.inf
+
+            if (
+                ws.has_what
+                and ws_memory >= mean_memory + half_gap
+                and ws_memory >= sender_min
+            ):
+                # This may send the worker below sender_min (by design)
+                snd_bytes_max = mean_memory - ws_memory  # negative
+                snd_bytes_min = snd_bytes_max + half_gap  # negative
+                # See definition of senders above
+                senders.append(
+                    (snd_bytes_max, snd_bytes_min, id(ws), ws, iter(ws._has_what))
+                )
+            elif ws_memory < mean_memory - half_gap and ws_memory < recipient_max:
+                recipients[ws] = int(min(mean_memory - half_gap, recipient_max))
+
+        heapq.heapify(senders)
+
+        def remove_bytes_from_top_sender(nbytes: int) -> None:
+            """Reduce amount of bytes that need to be moved out of a sender worker and
+            update the heap
+            """
+            bytes_max, bytes_min, _, ws, ts_iter = senders[0]
+            # bytes_max/min are negative to allow for heap sorting
+            bytes_max += nbytes
+            bytes_min += nbytes
+
+            if bytes_min < 0:
+                # See definition of senders above
+                heapq.heapreplace(senders, (bytes_max, bytes_min, id(ws), ws, ts_iter))
+            else:
+                heapq.heappop(senders)
+
+        while senders and recipients:
+            snd_bytes_max, _, _, snd_ws, ts_iter = senders[0]
+
+            # Iterate through tasks in memory, least recently inserted first
+            for ts in ts_iter:
+                # Skip if the task is currently being read in input on the same worker
+                if any(waiter_ts.processing_on is snd_ws for waiter_ts in ts.waiters):
+                    continue
+                # Skip if the task was already scheduled for replication or deletion by
+                # another policy
+                if ts in self.manager.pending:
+                    pending_repl, pending_drop = self.manager.pending[ts]
+                    if snd_ws in pending_drop:
+                        continue
+                    if pending_repl:
+                        remove_bytes_from_top_sender(ts.nbytes)
+                        continue
+
+                if ts.nbytes + snd_bytes_max > 0:
+                    # Moving this task would cause the sender to go below mean and
+                    # potentially risk becoming a recipient, which would cause tasks to
+                    # bounce around. Move on to the next task of the same sender.
+                    continue
+
+                rec_ws = yield Suggestion("replicate", ts, set(recipients))
+                if not rec_ws:
+                    # Suggestion rejected, e.g. because all recipients already hold a
+                    # copy. Move to next task.
+                    continue
+
+                # Stop iterating on the tasks of this sender for now and, if it still
+                # has bytes to lose, push it back into the senders heap; it may or may
+                # not come back on top again.
+                remove_bytes_from_top_sender(ts.nbytes)
+
+                # Potentially drop recipient which received the task
+                if self.manager.workers_memory[rec_ws] >= recipients[rec_ws]:
+                    del recipients[rec_ws]
+
+                # Move to next sender with the most data to lose.
+                # It may or may not be the same sender again.
+                break
+
+            else:  # for ts in ts_iter
+                # Exhausted tasks on this sender
+                heapq.heappop(senders)
