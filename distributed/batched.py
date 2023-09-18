@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import uuid
 from collections import deque
 from typing import Any
 
@@ -40,6 +41,18 @@ class BatchedSend:
         ['Hello,', 'world!']
     """
 
+    #: Unique identifier of this object
+    uuid: str
+    #: Unique sequential counter for message batches sent by this object
+    seq: int
+    #: Log of recently-sent messages
+    #:
+    #: See also
+    #: --------
+    #: distributed.core.Server.received_messages_log
+    #: distributed.client.Client.received_messages_log
+    sent_messages_log: deque[tuple[float, Any]]
+
     # XXX why doesn't BatchedSend follow either the IOStream or Comm API?
 
     def __init__(self, interval, loop=None, serializers=None):
@@ -55,11 +68,13 @@ class BatchedSend:
         self.batch_count = 0
         self.byte_count = 0
         self.next_deadline = None
-        self.recent_message_log = deque(
+        self.sent_messages_log = deque(
             maxlen=dask.config.get("distributed.admin.low-level-log-length")
         )
         self.serializers = serializers
         self._consecutive_failures = 0
+        self.uuid = str(uuid.uuid4())
+        self.seq = 0
 
     def start(self, comm):
         self.comm = comm
@@ -92,6 +107,11 @@ class BatchedSend:
                 # Send interval not expired yet
                 continue
             payload, self.buffer = self.buffer, []
+            log_info = {"sent": time(), "batched-id": (self.uuid, self.seq)}
+            self.seq += 1
+            for msg in payload:
+                if isinstance(msg, dict):
+                    msg.update(log_info)
             self.batch_count += 1
             self.next_deadline = time() + self.interval
             try:
@@ -113,10 +133,12 @@ class BatchedSend:
                     )
                 ) as coro:
                     nbytes = yield coro
-                if nbytes < 1e6:
-                    self.recent_message_log.append(payload)
-                else:
-                    self.recent_message_log.append("large-message")
+
+                if nbytes > 1e5:
+                    payload = [{"op": "large-message"}]
+                    payload[0].update(log_info)
+                self.sent_messages_log.append(payload)
+
                 self.byte_count += nbytes
             except CommClosedError:
                 logger.info("Batched Comm Closed %r", self.comm, exc_info=True)

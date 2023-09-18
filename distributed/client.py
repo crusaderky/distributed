@@ -15,7 +15,7 @@ import traceback
 import uuid
 import warnings
 import weakref
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Collection, Coroutine, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures._base import DoneAndNotDoneFutures
@@ -836,6 +836,14 @@ class Client(SyncMethodMixin):
     preloads: preloading.PreloadManager
     __loop: IOLoop | None = None
 
+    #: Log of recently-received messages
+    #:
+    #: See also
+    #: --------
+    #: distributed.batched.BatchedSend.sent_messages_log
+    #: distributed.core.Server.received_messages_log
+    received_messages_log: deque[dict[str, Any]]
+
     def __init__(
         self,
         address=None,
@@ -991,6 +999,10 @@ class Client(SyncMethodMixin):
             "lost": self._handle_lost_data,
             "erred": self._handle_task_erred,
         }
+
+        self.received_messages_log = deque(
+            maxlen=dask.config.get("distributed.admin.low-level-log-length")
+        )
 
         self.rpc = ConnectionPool(
             limit=connection_limit,
@@ -1582,6 +1594,14 @@ class Client(SyncMethodMixin):
                         raise exc.with_traceback(tb)
 
                     op = msg.pop("op")
+                    self.received_messages_log.append(
+                        {
+                            "op": op,
+                            "sent": msg.pop("sent", None),
+                            "received": time(),
+                            "batched-id": msg.pop("batched-id", None),
+                        }
+                    )
 
                     if op == "close" or op == "stream-closed":
                         breakout = True

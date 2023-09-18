@@ -321,6 +321,14 @@ class Server:
     _workspace: WorkSpace
     _workdir: None | WorkDir
 
+    #: Log of recently-received messages
+    #:
+    #: See also
+    #: --------
+    #: distributed.batched.BatchedSend.sent_messages_log
+    #: distributed.client.Client.received_messages_log
+    received_messages_log: deque[dict[str, Any]]
+
     def __init__(
         self,
         handlers,
@@ -404,6 +412,10 @@ class Server:
 
         self.listeners = []
         self.io_loop = self.loop = IOLoop.current()
+
+        self.received_messages_log = deque(
+            maxlen=dask.config.get("distributed.admin.low-level-log-length")
+        )
 
         if not hasattr(self.io_loop, "profile"):
             if dask.config.get("distributed.worker.profile.enabled"):
@@ -983,25 +995,35 @@ class Server:
                 if not isinstance(msgs, (tuple, list)):
                     msgs = (msgs,)
 
+                received_ts = time()
                 for msg in msgs:
                     if msg == "OK":
                         break
+
                     op = msg.pop("op")
-                    if op:
-                        if op == "close-stream":
-                            closed = True
-                            logger.info(
-                                "Received 'close-stream' from %s; closing.",
-                                comm.peer_address,
-                            )
-                            break
-                        handler = self.stream_handlers[op]
-                        if iscoroutinefunction(handler):
-                            await handler(**merge(extra, msg))
-                        else:
-                            handler(**merge(extra, msg))
+                    self.received_messages_log.append(
+                        {
+                            "op": op,
+                            "remote-addr": comm.peer_address,
+                            "batched-id": msg.pop("batched-id", None),
+                            "sent": msg.pop("sent", None),
+                            "received": received_ts,
+                        }
+                    )
+
+                    if op == "close-stream":
+                        closed = True
+                        logger.info(
+                            "Received 'close-stream' from %s; closing.",
+                            comm.peer_address,
+                        )
+                        break
+                    handler = self.stream_handlers[op]
+                    if iscoroutinefunction(handler):
+                        await handler(**merge(extra, msg))
                     else:
-                        logger.error("odd message %s", msg)
+                        handler(**merge(extra, msg))
+
                 await asyncio.sleep(0)
         except Exception:
             if LOG_PDB:
