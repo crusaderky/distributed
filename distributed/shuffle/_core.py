@@ -84,6 +84,7 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
         disk: bool,
         loop: IOLoop,
     ):
+        assert False
         self.id = id
         self.run_id = run_id
         self.local_address = local_address
