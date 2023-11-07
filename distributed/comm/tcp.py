@@ -37,6 +37,7 @@ from distributed.comm.utils import (
     get_tcp_server_address,
     to_frames,
 )
+from distributed.metrics import context_meter
 from distributed.protocol.utils import host_array, pack_frames_prelude, unpack_frames
 from distributed.system import MEMORY_LIMIT
 from distributed.utils import ensure_ip, ensure_memoryview, get_ip, get_ipv6, nbytes
@@ -212,113 +213,115 @@ class TCP(Comm):
         return self._peer_addr
 
     async def read(self, deserializers=None):
-        stream = self.stream
-        if stream is None:
-            raise CommClosedError()
+        with context_meter.meter("tcp-read-other"):
+            stream = self.stream
+            if stream is None:
+                raise CommClosedError()
 
-        fmt = "Q"
-        fmt_size = struct.calcsize(fmt)
+            fmt = "Q"
+            fmt_size = struct.calcsize(fmt)
 
-        try:
-            # Don't store multiple numpy or parquet buffers into the same buffer, or
-            # none will be released until all are released.
-            frames_nosplit_nbytes_bin = await stream.read_bytes(fmt_size)
-            (frames_nosplit_nbytes,) = struct.unpack(fmt, frames_nosplit_nbytes_bin)
-            frames_nosplit = await read_bytes_rw(stream, frames_nosplit_nbytes)
-            frames, buffers_nbytes = unpack_frames(frames_nosplit, partial=True)
-            for buffer_nbytes in buffers_nbytes:
-                buffer = await read_bytes_rw(stream, buffer_nbytes)
-                frames.append(buffer)
-
-        except StreamClosedError as e:
-            self.stream = None
-            self._closed = True
-            if not sys.is_finalizing():
-                convert_stream_closed_error(self, e)
-        except BaseException:
-            # Some OSError, CancelledError or another "low-level" exception.
-            # We do not really know what was already read from the underlying
-            # socket, so it is not even safe to retry here using the same stream.
-            # The only safe thing to do is to abort.
-            # (See also GitHub #4133, #6548).
-            self.abort()
-            raise
-        else:
             try:
-                msg = await from_frames(
-                    frames,
-                    deserialize=self.deserialize,
-                    deserializers=deserializers,
-                    allow_offload=self.allow_offload,
-                )
-            except EOFError:
-                # Frames possibly garbled or truncated by communication error
+                # Don't store multiple numpy or parquet buffers into the same buffer, or
+                # none will be released until all are released.
+                frames_nosplit_nbytes_bin = await read_bytes_rw(stream, fmt_size)
+                (frames_nosplit_nbytes,) = struct.unpack(fmt, frames_nosplit_nbytes_bin)
+                frames_nosplit = await read_bytes_rw(stream, frames_nosplit_nbytes)
+                frames, buffers_nbytes = unpack_frames(frames_nosplit, partial=True)
+                for buffer_nbytes in buffers_nbytes:
+                    buffer = await read_bytes_rw(stream, buffer_nbytes)
+                    frames.append(buffer)
+
+            except StreamClosedError as e:
+                self.stream = None
+                self._closed = True
+                if not sys.is_finalizing():
+                    convert_stream_closed_error(self, e)
+            except BaseException:
+                # Some OSError, CancelledError or another "low-level" exception.
+                # We do not really know what was already read from the underlying
+                # socket, so it is not even safe to retry here using the same stream.
+                # The only safe thing to do is to abort.
+                # (See also GitHub #4133, #6548).
                 self.abort()
-                raise CommClosedError("aborted stream on truncated data")
-            return msg
+                raise
+            else:
+                try:
+                    msg = await from_frames(
+                        frames,
+                        deserialize=self.deserialize,
+                        deserializers=deserializers,
+                        allow_offload=self.allow_offload,
+                    )
+                except EOFError:
+                    # Frames possibly garbled or truncated by communication error
+                    self.abort()
+                    raise CommClosedError("aborted stream on truncated data")
+                return msg
 
     async def write(self, msg, serializers=None, on_error="message"):
-        stream = self.stream
-        if stream is None:
-            raise CommClosedError()
+        with context_meter.meter("tcp-write-other"):
+            stream = self.stream
+            if stream is None:
+                raise CommClosedError()
 
-        frames = await to_frames(
-            msg,
-            allow_offload=self.allow_offload,
-            serializers=serializers,
-            on_error=on_error,
-            context={
-                "sender": self.local_info,
-                "recipient": self.remote_info,
-                **self.handshake_options,
-            },
-            frame_split_size=self.max_shard_size,
-        )
-        frames, frames_nbytes, frames_nbytes_total = _add_frames_header(frames)
+            frames = await to_frames(
+                msg,
+                allow_offload=self.allow_offload,
+                serializers=serializers,
+                on_error=on_error,
+                context={
+                    "sender": self.local_info,
+                    "recipient": self.remote_info,
+                    **self.handshake_options,
+                },
+                frame_split_size=self.max_shard_size,
+            )
+            frames, frames_nbytes, frames_nbytes_total = _add_frames_header(frames)
 
-        try:
-            # trick to enqueue all frames for writing beforehand
-            for each_frame_nbytes, each_frame in zip(frames_nbytes, frames):
-                if each_frame_nbytes:
-                    # Make sure that `len(data) == data.nbytes`
-                    # See <https://github.com/tornadoweb/tornado/pull/2996>
-                    each_frame = ensure_memoryview(each_frame)
-                    for i, j in sliding_window(
-                        2,
-                        range(
-                            0,
-                            each_frame_nbytes + OPENSSL_MAX_CHUNKSIZE,
-                            OPENSSL_MAX_CHUNKSIZE,
-                        ),
-                    ):
-                        chunk = each_frame[i:j]
-                        chunk_nbytes = chunk.nbytes
+            try:
+                # trick to enqueue all frames for writing beforehand
+                for each_frame_nbytes, each_frame in zip(frames_nbytes, frames):
+                    if each_frame_nbytes:
+                        # Make sure that `len(data) == data.nbytes`
+                        # See <https://github.com/tornadoweb/tornado/pull/2996>
+                        each_frame = ensure_memoryview(each_frame)
+                        for i, j in sliding_window(
+                            2,
+                            range(
+                                0,
+                                each_frame_nbytes + OPENSSL_MAX_CHUNKSIZE,
+                                OPENSSL_MAX_CHUNKSIZE,
+                            ),
+                        ):
+                            chunk = each_frame[i:j]
+                            chunk_nbytes = chunk.nbytes
 
-                        if stream._write_buffer is None:
-                            raise StreamClosedError()
+                            if stream._write_buffer is None:
+                                raise StreamClosedError()
 
-                        stream._write_buffer.append(chunk)
-                        stream._total_write_index += chunk_nbytes
+                            stream._write_buffer.append(chunk)
+                            stream._total_write_index += chunk_nbytes
 
-            # start writing frames
-            stream.write(b"")
-        except StreamClosedError as e:
-            self.stream = None
-            self._closed = True
-            if not sys.is_finalizing():
-                convert_stream_closed_error(self, e)
-        except BaseException:
-            # Some OSError or a another "low-level" exception. We do not really know
-            # what was already written to the underlying socket, so it is not even safe
-            # to retry here using the same stream. The only safe thing to do is to
-            # abort. (See also GitHub #4133).
-            # In case of, for instance, KeyboardInterrupts or other
-            # BaseExceptions that could be handled further upstream, we equally
-            # want to discard this comm
-            self.abort()
-            raise
+                # start writing frames
+                stream.write(b"")
+            except StreamClosedError as e:
+                self.stream = None
+                self._closed = True
+                if not sys.is_finalizing():
+                    convert_stream_closed_error(self, e)
+            except BaseException:
+                # Some OSError or a another "low-level" exception. We do not really know
+                # what was already written to the underlying socket, so it is not even safe
+                # to retry here using the same stream. The only safe thing to do is to
+                # abort. (See also GitHub #4133).
+                # In case of, for instance, KeyboardInterrupts or other
+                # BaseExceptions that could be handled further upstream, we equally
+                # want to discard this comm
+                self.abort()
+                raise
 
-        return frames_nbytes_total
+            return frames_nbytes_total
 
     @gen.coroutine
     def close(self):
@@ -359,15 +362,17 @@ async def read_bytes_rw(stream: IOStream, n: int) -> memoryview:
     very large messages and return a writeable buffer.
     """
     buf = host_array(n)
+    with context_meter.meter("tcp-read-stream"):
+        for i, j in sliding_window(
+            2,
+            range(0, n + OPENSSL_MAX_CHUNKSIZE, OPENSSL_MAX_CHUNKSIZE),
+        ):
+            chunk = buf[i:j]
+            chunk_nbytes = chunk.nbytes
+            nread = await stream.read_into(chunk)  # type: ignore[arg-type]
+            assert nread == chunk_nbytes, (nread, chunk_nbytes)
 
-    for i, j in sliding_window(
-        2,
-        range(0, n + OPENSSL_MAX_CHUNKSIZE, OPENSSL_MAX_CHUNKSIZE),
-    ):
-        chunk = buf[i:j]
-        actual = await stream.read_into(chunk)  # type: ignore[arg-type]
-        assert actual == chunk.nbytes
-
+    context_meter.digest_metric("tcp-read", n, "bytes")
     return buf
 
 
