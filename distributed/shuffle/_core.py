@@ -24,13 +24,14 @@ from dask.utils import parse_timedelta
 
 from distributed.core import PooledRPCCall
 from distributed.exceptions import Reschedule
+from distributed.metrics import context_meter, thread_time
 from distributed.protocol import to_serialize
 from distributed.shuffle._comms import CommShardsBuffer
 from distributed.shuffle._disk import DiskShardsBuffer
 from distributed.shuffle._exceptions import ShuffleClosedError
 from distributed.shuffle._limiter import ResourceLimiter
 from distributed.shuffle._memory import MemoryShardsBuffer
-from distributed.utils import sync
+from distributed.utils import run_in_executor_with_context, sync
 from distributed.utils_comm import retry
 
 if TYPE_CHECKING:
@@ -183,9 +184,9 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
         self, func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
     ) -> _T:
         self.raise_if_closed()
-        with self.time("cpu"):
-            return await asyncio.get_running_loop().run_in_executor(
-                self.executor, partial(func, *args, **kwargs)
+        with self.time("cpu"), context_meter.meter("shuffle-offload"):
+            return await run_in_executor_with_context(
+                self.executor, func, *args, **kwargs
             )
 
     def heartbeat(self) -> dict[str, Any]:
@@ -284,8 +285,10 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
         self.raise_if_closed()
         if self.transferred:
             raise RuntimeError(f"Cannot add more partitions to {self}")
-        shards = self._shard_partition(data, partition_id)
-        sync(self._loop, self._write_to_comm, shards)
+        with context_meter.meter("shuffle-shard-partition"):
+            shards = self._shard_partition(data, partition_id)
+        with context_meter.meter("shuffle-write-to-comm"):
+            sync(self._loop, self._write_to_comm, shards)
         return self.run_id
 
     @abc.abstractmethod
@@ -302,7 +305,11 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
         if not self.transferred:
             raise RuntimeError("`get_output_partition` called before barrier task")
         sync(self._loop, self.flush_receive)
-        return self._get_output_partition(partition_id, key, **kwargs)
+        with (
+            context_meter.meter("shuffle-get-output-disk"),
+            context_meter.meter("shuffle-get-output-cpu", func=thread_time),
+        ):
+            return self._get_output_partition(partition_id, key, **kwargs)
 
     @abc.abstractmethod
     def _get_output_partition(
