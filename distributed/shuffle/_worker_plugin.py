@@ -277,8 +277,12 @@ class ShuffleWorkerPlugin(WorkerPlugin):
         # Initialize
         self.worker = worker
         self.shuffle_runs = _ShuffleRunManager(self)
-        self.memory_limiter_comms = ResourceLimiter(parse_bytes("100 MiB"))
-        self.memory_limiter_disk = ResourceLimiter(parse_bytes("1 GiB"))
+        self.memory_limiter_comms = ResourceLimiter(
+            parse_bytes("100 MiB"), metrics_label="shuffle-comms-limiter"
+        )
+        self.memory_limiter_disk = ResourceLimiter(
+            parse_bytes("1 GiB"), metrics_label="shuffle-disk-limiter"
+        )
         self.closed = False
         self._executor = ThreadPoolExecutor(self.worker.state.nthreads)
 

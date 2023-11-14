@@ -287,8 +287,7 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
             raise RuntimeError(f"Cannot add more partitions to {self}")
         with context_meter.meter("shuffle-shard-partition"):
             shards = self._shard_partition(data, partition_id)
-        with context_meter.meter("shuffle-write-to-comm"):
-            sync(self._loop, self._write_to_comm, shards)
+        sync(self._loop, self._write_to_comm, shards)
         return self.run_id
 
     @abc.abstractmethod
