@@ -97,6 +97,7 @@ class ShuffleRun(Generic[_T_partition_id, _T_partition_type]):
                 directory=directory,
                 read=self.read,
                 memory_limiter=memory_limiter_disk,
+                offload=self.offload,
             )
         else:
             self._disk_buffer = MemoryShardsBuffer(deserialize=self.deserialize)

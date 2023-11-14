@@ -4,7 +4,7 @@ import contextlib
 import pathlib
 import shutil
 import threading
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Awaitable, Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import Any
 
@@ -126,6 +126,7 @@ class DiskShardsBuffer(ShardsBuffer):
         directory: str | pathlib.Path,
         read: Callable[[pathlib.Path], tuple[Any, int]],
         memory_limiter: ResourceLimiter,
+        offload: Callable[..., Awaitable],
     ):
         super().__init__(
             memory_limiter=memory_limiter,
@@ -137,6 +138,7 @@ class DiskShardsBuffer(ShardsBuffer):
         self._closed = False
         self._read = read
         self._directory_lock = ReadWriteLock()
+        self.offload = offload
 
     async def _process(self, id: str, shards: list[Any]) -> None:
         """Write one buffer to file
@@ -152,26 +154,29 @@ class DiskShardsBuffer(ShardsBuffer):
         dropping the write into communicate above.
         """
 
+        def write() -> None:
+            # We only need shared (i.e., read) access to the directory to write
+            # to a file inside of it.
+
+            frames: Iterable[bytes | bytearray | memoryview]
+
+            if isinstance(shards[0], bytes):
+                # Manually serialized dataframes
+                frames = shards
+            else:
+                # Unserialized numpy arrays
+                frames = concat(pickle_bytelist(shard) for shard in shards)
+
+            with open(self.directory / str(id), mode="ab") as f:
+                f.writelines(frames)
+
         with log_errors():
-            # Consider boosting total_size a bit here to account for duplication
-            with self.time("write"):
-                # We only need shared (i.e., read) access to the directory to write
-                # to a file inside of it.
-                with self._directory_lock.read():
-                    if self._closed:
-                        raise RuntimeError("Already closed")
+            with self._directory_lock.read():
+                if self._closed:
+                    raise RuntimeError("Already closed")
 
-                    frames: Iterable[bytes | bytearray | memoryview]
-
-                    if isinstance(shards[0], bytes):
-                        # Manually serialized dataframes
-                        frames = shards
-                    else:
-                        # Unserialized numpy arrays
-                        frames = concat(pickle_bytelist(shard) for shard in shards)
-
-                    with open(self.directory / str(id), mode="ab") as f:
-                        f.writelines(frames)
+                with self.time("write"):
+                    await self.offload(write)
 
     def read(self, id: str) -> Any:
         """Read a complete file back into memory"""
