@@ -182,6 +182,11 @@ WORKER_ANY_RUNNING = {
     Status.paused,
     Status.closing_gracefully,
 }
+WORKER_ANY_STARTING = {
+    Status.created,
+    Status.init,
+    Status.starting,
+}
 
 
 class GetDataBusy(TypedDict):

@@ -135,7 +135,7 @@ from distributed.utils_comm import (
 )
 from distributed.utils_perf import disable_gc_diagnosis, enable_gc_diagnosis
 from distributed.variable import VariableExtension
-from distributed.worker import _normalize_task
+from distributed.worker import WORKER_ANY_RUNNING, WORKER_ANY_STARTING, _normalize_task
 
 if TYPE_CHECKING:
     # TODO import from typing (requires Python >=3.10)
@@ -5837,21 +5837,34 @@ class Scheduler(SchedulerState, ServerNode):
         ws = self.workers.get(worker) if isinstance(worker, str) else worker
         if not ws:
             return
-        prev_status = ws.status
-        ws.status = Status[status] if isinstance(status, str) else status
-        if ws.status == prev_status:
+        if isinstance(status, str):
+            status = Status[status]
+        if status == ws.status:
+            return
+
+        if (
+            status in WORKER_ANY_RUNNING
+            and ws.status not in WORKER_ANY_STARTING | WORKER_ANY_RUNNING
+        ):
+            # This can happen when something sets the worker status e.g. to failed
+            # but doesn't remove it straight away
+            logger.error(
+                "Unadmissible worker status change "
+                f"{ws.status.name} -> {status.name}: {ws}"
+            )
             return
 
         self.log_event(
             ws.address,
             {
                 "action": "worker-status-change",
-                "prev-status": prev_status.name,
-                "status": ws.status.name,
+                "prev-status": ws.status.name,
+                "status": status.name,
                 "stimulus_id": stimulus_id,
             },
         )
-        logger.debug(f"Worker status {prev_status.name} -> {status} - {ws}")
+        logger.debug(f"Worker status {ws.status.name} -> {status.name}: {ws}")
+        ws.status = status
 
         if ws.status == Status.running:
             self.running.add(ws)
