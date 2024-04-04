@@ -9,7 +9,18 @@ from toolz import first
 from distributed.protocol.utils import pack_frames_prelude, unpack_frames
 
 if TYPE_CHECKING:
+    from pandas.core.internals.blocks import Block
+
+try:
+    # We'll never run a shuffle if numpy and pandas are not installed
+    # TODO reinstate support for pandas 1.x
     import pandas as pd
+    from pandas._libs.internals import BlockPlacement
+    from pandas.core.arrays import StringArray
+    from pandas.core.internals import BlockManager
+    from pandas.core.internals.blocks import new_block
+except Exception:
+    pass
 
 
 def pickle_bytelist(obj: object, prelude: bool = True) -> list[pickle.PickleBuffer]:
@@ -46,6 +57,74 @@ def unpickle_bytestream(b: bytes | bytearray | memoryview) -> Iterator[Any]:
         b = remainder
 
 
+def _bare_array(wrapper: Any) -> Any:
+    if isinstance(wrapper, StringArray):
+        # backend is ndarray[object] but has a __arrow_array__ method
+        # TODO the wrapper class can be inferred from meta
+        return StringArray, wrapper.__array__()  # type: ignore[attr-defined]
+    elif hasattr(wrapper, "__arrow_array__"):
+        # TODO the wrapper class can be inferred from the wrapped array
+        return type(wrapper), wrapper.__arrow_array__()
+    else:
+        return wrapper.__array__()
+
+
+def _rebuild_array(obj: Any) -> Any:
+    if isinstance(obj, tuple):
+        cls, values = obj
+        return cls(values)
+    else:
+        return obj
+
+
+def _bare_index(idx: pd.Index) -> tuple:
+    if isinstance(idx, pd.MultiIndex):
+        # Tiny ndarrays; faster to serialize as lists of ints
+        codes = [c.tolist() for c in idx.codes]
+        return *(_bare_index(level) for level in idx.levels), codes
+    elif isinstance(idx, pd.RangeIndex):
+        return idx.start, idx.stop, idx.step, idx.dtype, idx.name
+    else:
+        return _bare_array(idx.values), idx.name
+
+
+def _rebuild_index(bare: tuple) -> pd.Index:
+    if isinstance(bare[0], tuple):
+        levels = [_rebuild_index(level) for level in bare[:-1]]
+        codes = bare[-1]
+        names = [level.name for level in levels]
+        return pd.MultiIndex(levels, codes, names=names, verify_integrity=False)
+    elif isinstance(bare[0], int):
+        start, stop, step, dtype, name = bare
+        return pd.RangeIndex(start, stop, step, dtype, name=name)
+    else:
+        values, name = bare
+        return pd.Index(_rebuild_array(values), name=name)
+
+
+def _bare_block(block: Block) -> tuple:
+    arr = _bare_array(block.values)
+    slice_ = block.mgr_locs.as_slice
+    if slice_.stop == slice_.start + 1 and slice_.step == 1 and block.ndim == 1:
+        return arr, slice_.start
+    else:
+        return arr, slice_.start, slice_.stop, slice_.step, block.ndim
+
+
+def _rebuild_block(bare: tuple) -> Iterator[Block]:
+    if len(bare) == 2:
+        values, start = bare
+        stop, step, ndim = start + 1, 1, 1
+    else:
+        values, start, stop, step, ndim = bare
+
+    return new_block(
+        _rebuild_array(values),
+        BlockPlacement(slice(start, stop, step)),
+        ndim=ndim,
+    )
+
+
 def pickle_dataframe_shard(
     input_part_id: int,
     shard: pd.DataFrame,
@@ -57,7 +136,12 @@ def pickle_dataframe_shard(
         obj: pandas
     """
     return pickle_bytelist(
-        (input_part_id, shard.index, *shard._mgr.blocks), prelude=False
+        (
+            input_part_id,
+            _bare_index(shard.index),
+            *(_bare_block(block) for block in shard._mgr.blocks),
+        ),
+        prelude=False,
     )
 
 
@@ -92,19 +176,16 @@ def unpickle_and_concat_dataframe_shards(
     >>> blob = bytearray(b"".join(concat(frames)))  # Simulate disk roundtrip
     >>> df2 = unpickle_and_concat_dataframe_shards(blob, meta)
     """
-    import pandas as pd
-    from pandas.core.internals import BlockManager
-
     parts = list(unpickle_bytestream(b))
     # [(input_part_id, index, *blocks), ...]
     parts.sort(key=first)
     shards = []
-    for _, idx, *blocks in parts:
-        axes = [meta.columns, idx]
-        df = pd.DataFrame._from_mgr(  # type: ignore[attr-defined]
-            BlockManager(blocks, axes, verify_integrity=False), axes
-        )
-        shards.append(df)
+    for _, raw_idx, *raw_blocks in parts:
+        axes = [meta.columns, _rebuild_index(raw_idx)]
+        blocks = [_rebuild_block(block) for block in raw_blocks]
+        mgr = BlockManager(blocks, axes, verify_integrity=False)
+        shard = pd.DataFrame._from_mgr(mgr, axes)  # type: ignore[attr-defined]
+        shards.append(shard)
 
     # Actually load memory-mapped buffers into memory and close the file
     # descriptors
