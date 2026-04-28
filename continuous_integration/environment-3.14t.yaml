@@ -18,12 +18,12 @@ dependencies:
   - fsspec  # overridden by git tip below
   # - gilknocker  # Makes no sense in free-threading
   - h5py
-  - ipykernel
+  # - ipykernel  # No 3.14t for Windows yet
   - ipywidgets
   - jinja2
   - jupyter_events
-  - jupyter-server-proxy
-  - jupyterlab
+  # - jupyter-server-proxy  # No ipykernel 3.14t for Windows yet
+  # - jupyterlab  # No ipykernel 3.14t for Windows yet
   - locket
   # FIXME https://github.com/msgpack/msgpack-python/issues/613
   # tests.yml replaces this with a pure-python variant.
