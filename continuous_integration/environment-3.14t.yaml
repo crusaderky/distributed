@@ -10,7 +10,11 @@ dependencies:
   - click
   - cloudpickle
   - coverage
-  - dask  # overridden by git tip below; pulls in optional dependencies
+  # This pulls in a dependency chain (specific to conda)
+  # dask -> distributed -> urllib3 -> brotli
+  # and brotli does not release the GIL.
+  # Manually install dask dependencies from conda below.
+  # - dask  # overridden by git tip below; pulls in optional dependencies
   - fsspec  # overridden by git tip below
   # - gilknocker  # Makes no sense in free-threading
   - h5py
@@ -46,6 +50,23 @@ dependencies:
   - tornado
   - zict  # overridden by git tip below
   - zstandard
+
+  ##### 3.14t temporary hacks
+  # packages normally pulled in by the `dask` conda package
+  - dask-core
+  - cytoolz
+  - lz4
+  - numpy
+  - pandas >=3.0.1
+  - pyarrow
+  - bokeh
+  - jinja2
+  - pyyaml
+  - sortedcontainers
+  # Uniquely used by preload. Depends on brotli, which does not release the GIL
+  # - urllib3
+  ##### end 3.14t hacks
+
   - pip:
       - git+https://github.com/dask/dask
       - git+https://github.com/dask/zict
