@@ -5852,7 +5852,9 @@ class Scheduler(SchedulerState, ServerNode):
         for k in keys:
             ts = self.tasks.get(k)
             if ts is None:
-                warnings.warn(f"Client desires key {k!r} but key is unknown.")
+                warnings.warn(
+                    f"Client {client!r} desires key {k!r} but key is unknown."
+                )
                 continue
             if ts.who_wants is None:
                 ts.who_wants = set()
