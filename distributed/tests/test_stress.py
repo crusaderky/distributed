@@ -310,6 +310,9 @@ async def test_no_delay_during_large_transfer(c, s, w):
     client=True,
     Worker=Nanny,
     nthreads=[("", 2)] * 6,
+    # On heavily loaded CI hosts, starting the cluster can take longer than the
+    # whole default budget, while the test body by design runs for 10+ seconds
+    timeout=120,
     scheduler_kwargs={"transition_counter_max": 500_000},
     worker_kwargs={"transition_counter_max": 500_000},
 )
