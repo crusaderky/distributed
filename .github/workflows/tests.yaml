@@ -114,7 +114,7 @@ jobs:
           set -o pipefail
           mkdir reports
 
-          pixi run -e ${{ matrix.environment }} ${{ matrix.task }} distributed/tests/test_spans.py::test_collections_metadata --count 500 \
+          pixi run -e ${{ matrix.environment }} ${{ matrix.task }} distributed/tests/test_spans.py::test_collections_metadata --count 5000 \
           | tee pytest-stdout.log
 
       - name: Generate or post-process coverage.xml and pytest.xml
