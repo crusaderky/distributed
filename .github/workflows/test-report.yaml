@@ -36,9 +36,9 @@ jobs:
       - uses: actions/cache@v6.1.0
         id: cache
         with:
-          # Local databases of downloaded test results, created by test_report.py
-          path: test_report*.db
-          # Caches are immutable; use a fresh key to upload an updated database at
+          # Local cache of downloaded test results, created by test_report.py
+          path: test_report*.pickle
+          # Caches are immutable; use a fresh key to upload an updated cache at
           # the end of every run, and restore from the most recent one.
           key: test-report-${{ hashFiles('continuous_integration/scripts/test_report.py') }}-${{ github.run_id }}
           restore-keys: test-report-${{ hashFiles('continuous_integration/scripts/test_report.py') }}-
@@ -56,12 +56,12 @@ jobs:
           name: test-report
           path: deploy
 
-      - name: Upload databases as workflow artifact
+      - name: Upload cache as workflow artifact
         # For debugging purposes
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: test-report-db
-          path: test_report*.db
+          name: test-report-cache
+          path: test_report*.pickle
 
   deploy:
     name: Deploy report

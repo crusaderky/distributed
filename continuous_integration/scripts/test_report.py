@@ -5,12 +5,12 @@ import contextlib
 import html
 import io
 import os
+import pickle
 import re
-import shelve
 import subprocess
 import sys
 import zipfile
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, cast
 
@@ -26,6 +26,10 @@ TOKEN: str | None = None
 # Latest substantial change in the output format of tests.yaml
 # Disregard workflow runs older than this date.
 CUTOFF = pandas.Timestamp("2026-06-04", tz="UTC")
+
+# Columns kept for each cached artifact. This is exactly what the report needs;
+# everything else (raw XML, job metadata, ...) is dropped as soon as possible.
+COLUMNS = ["test", "date", "suite", "file", "html_url", "status", "message"]
 
 # Mapping between a symbol (pass, fail, skip) and a color
 COLORS = {
@@ -53,9 +57,9 @@ def get_token() -> str:
     return proc.stdout.strip()
 
 
-def cache_name(prefix: str, repo: str) -> str:
-    """Name of the local cache database, e.g. test_report.dask__distributed.db"""
-    return f"{prefix}.{repo.replace('/', '__')}.db"
+def cache_name(repo: str) -> str:
+    """Name of the local cache pickle, e.g. test_report.dask__distributed.pickle"""
+    return f"test_report.{repo.replace('/', '__')}.pickle"
 
 
 @contextlib.contextmanager
@@ -102,7 +106,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--max-runs",
         type=int,
         default=50,
-        help="Maximum number of workflow runs to fetch",
+        help="Maximum number of workflow runs to show (and, unless --report-only, "
+        "to fetch artifacts for)",
     )
     parser.add_argument(
         "--nfails",
@@ -118,6 +123,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Output file name",
     )
     parser.add_argument("--title", "-t", default="Test Report", help="Report title")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Generate the report straight from the local cache, without "
+        "downloading new artifacts, pruning, or updating the cache on disk",
+    )
+    parser.add_argument(
+        "--prune-db",
+        action="store_true",
+        help="Drop from the local cache any artifacts older than --max-days before "
+        "saving it back to disk",
+    )
     return parser.parse_args(argv)
 
 
@@ -132,103 +149,95 @@ def get_from_github(
     return r
 
 
-def maybe_get_next_page_path(response: requests.Response) -> str | None:
-    """
-    If a response is paginated, get the url for the next page.
+def get_all_pages(
+    url: str, key: str, params: dict[str, Any], session: requests.Session
+) -> list[dict]:
+    """Fetch every page of a paginated GitHub list endpoint and concatenate the
+    ``key`` field of each page.
     """
     link_regex = re.compile(r'<([^>]*)>;\s*rel="([\w]*)\"')
-    link_headers = response.headers.get("Link")
-    next_page_path = None
-    if link_headers:
-        links = {}
-        matched = link_regex.findall(link_headers)
-        for match in matched:
-            links[match[1]] = match[0]
-        next_page_path = links.get("next", None)
-
-    return next_page_path
-
-
-def get_jobs(run, session, repo):
-    with shelve.open(cache_name("test_report_jobs", repo)) as cache:
-        url = run["jobs_url"]
-        try:
-            jobs = cache[url]
-        except KeyError:
-            params = {"per_page": 100}
-            r = get_from_github(run["jobs_url"], params, session=session)
-            jobs = r.json()["jobs"]
-            while next_page := maybe_get_next_page_path(r):
-                r = get_from_github(next_page, params=params, session=session)
-                jobs.extend(r.json()["jobs"])
-            cache[url] = jobs
-
-    df_jobs = pandas.DataFrame.from_records(jobs)
-    df_jobs = df_jobs[df_jobs.name != "Event File"]
-
-    # Reconstruct the artifact name from the job name, so that it can later be
-    # joined with the JXML results. Job names are space-separated, e.g.
-    #     ubuntu-latest py310 test-ci not ci1
-    # whereas the matching artifact is named after $TEST_ID (see the
-    # `Set $TEST_ID` step in tests.yaml), which is dash-separated and with the
-    # space removed from the partition name:
-    #     ubuntu-latest-py310-test-ci-notci1
-    # dask/dask job names are the same, minus the trailing partition.
-    df_jobs["suite_name"] = df_jobs.name.str.replace(" not ci1", " notci1").str.replace(
-        " ", "-"
-    )
-    return df_jobs
+    out: list[dict] = []
+    next_url: str | None = url
+    while next_url:
+        r = get_from_github(next_url, params, session=session)
+        out += r.json()[key]
+        next_url = None
+        if link_headers := r.headers.get("Link"):
+            links = dict((rel, href) for href, rel in link_regex.findall(link_headers))
+            next_url = links.get("next")
+    return out
 
 
-def get_workflow_run_listing(
-    repo: str, branch: str, event: str, days: int, session: requests.Session
+def get_test_runs(
+    repo: str, branch: str, events: list[str], max_days: int, session: requests.Session
 ) -> list[dict]:
+    """List the most recent completed "Tests" workflow runs still within the
+    retention window (i.e. created no more than ``max_days`` ago and no earlier
+    than ``CUTOFF``).
     """
-    Get a list of workflow runs from GitHub actions.
-    """
-    since = (pandas.Timestamp.now(tz="UTC") - pandas.Timedelta(days=days)).date()
+    since = (pandas.Timestamp.now(tz="UTC") - pandas.Timedelta(days=max_days)).date()
     since = max(since, CUTOFF.date())
-    params = {
-        "per_page": 100,
-        "branch": branch,
-        "event": event,
-        "created": f">={since}",
-    }
-    r = get_from_github(
-        f"https://api.github.com/repos/{repo}/actions/runs",
-        params=params,
-        session=session,
-    )
-    runs = r.json()["workflow_runs"]
-    next_page = maybe_get_next_page_path(r)
-    while next_page:
-        r = get_from_github(next_page, params, session=session)
-        runs += r.json()["workflow_runs"]
-        next_page = maybe_get_next_page_path(r)
 
-    return runs
+    runs = []
+    for event in events:
+        runs += get_all_pages(
+            f"https://api.github.com/repos/{repo}/actions/runs",
+            key="workflow_runs",
+            params={
+                "per_page": 100,
+                "branch": branch,
+                "event": event,
+                "created": f">={since}",
+            },
+            session=session,
+        )
+
+    return [
+        r
+        for r in runs
+        if (
+            pandas.to_datetime(r["created_at"]) >= CUTOFF
+            and r["status"] == "completed"
+            and r["conclusion"] != "cancelled"
+            and r["name"].lower() == "tests"
+        )
+    ]
 
 
-def get_artifacts_for_workflow_run(
-    run_id: str, repo: str, session: requests.Session
-) -> list:
-    """
-    Get a list of artifacts from GitHub actions
-    """
-    params = {"per_page": 100}
-    r = get_from_github(
+def get_artifacts(run_id: int, repo: str, session: requests.Session) -> list[dict]:
+    """List the JUnit XML artifacts of a workflow run."""
+    artifacts = get_all_pages(
         f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
-        params=params,
+        key="artifacts",
+        params={"per_page": 100},
         session=session,
     )
-    artifacts = r.json()["artifacts"]
-    next_page = maybe_get_next_page_path(r)
-    while next_page:
-        r = get_from_github(next_page, params=params, session=session)
-        artifacts += r.json()["artifacts"]
-        next_page = maybe_get_next_page_path(r)
+    return [
+        a
+        for a in artifacts
+        if not a["expired"]
+        and a["name"] != "Event File"
+        and "cluster_dumps" not in a["name"]
+    ]
 
-    return artifacts
+
+def get_job_urls(run: dict, session: requests.Session) -> dict[str, str]:
+    """Map each artifact name to the html_url of the job that produced it.
+
+    Job names are space-separated, e.g. ``ubuntu-latest py310 test-ci not ci1``,
+    whereas the matching artifact is named after $TEST_ID (see the ``Set $TEST_ID``
+    step in tests.yaml), which is dash-separated with the space removed from the
+    partition name: ``ubuntu-latest-py310-test-ci-notci1``. dask/dask job names are
+    the same, minus the trailing partition.
+    """
+    jobs = get_all_pages(
+        run["jobs_url"], key="jobs", params={"per_page": 100}, session=session
+    )
+    return {
+        job["name"].replace(" not ci1", " notci1").replace(" ", "-"): job["html_url"]
+        for job in jobs
+        if job["name"] != "Event File"
+    }
 
 
 def suite_from_name(name: str) -> str:
@@ -240,26 +249,6 @@ def suite_from_name(name: str) -> str:
     return re.sub(r"-(not)?ci1$", "", name)
 
 
-def download_and_parse_artifact(
-    url: str, repo: str, session: requests.Session
-) -> junitparser.JUnitXml | None:
-    """
-    Download the artifact at the url parse it.
-    """
-    with shelve.open(cache_name("test_report", repo)) as cache:
-        try:
-            xml_raw = cache[url]
-        except KeyError:
-            r = get_from_github(url, params={}, session=session)
-            f = zipfile.ZipFile(io.BytesIO(r.content))
-            cache[url] = xml_raw = f.read(f.filelist[0].filename)
-    try:
-        return junitparser.JUnitXml.fromstring(xml_raw)
-    except Exception:
-        # e.g. truncated XML from a job that hit the timeout
-        return None
-
-
 def dataframe_from_jxml(run: Iterable) -> pandas.DataFrame:
     """
     Turn a parsed JXML into a pandas dataframe
@@ -268,10 +257,8 @@ def dataframe_from_jxml(run: Iterable) -> pandas.DataFrame:
     tname = []
     status = []
     message = []
-    sname = []
     for suite in run:
         for test in suite:
-            sname.append(suite.name)
             fname.append(test.classname)
             tname.append(test.name)
             s = "✓"
@@ -283,24 +270,15 @@ def dataframe_from_jxml(run: Iterable) -> pandas.DataFrame:
                 continue
             result = result[0]
             m = result.message if result and hasattr(result, "message") else ""
-            if isinstance(result, junitparser.Error):
-                s = "x"
-            elif isinstance(result, junitparser.Failure):
-                s = "x"
-            elif isinstance(result, junitparser.Skipped):
+            if isinstance(result, junitparser.Skipped):
                 s = "s"
             else:
+                # junitparser.Error, junitparser.Failure, or anything unexpected
                 s = "x"
             status.append(s)
             message.append(html.escape(m))
     df = pandas.DataFrame(
-        {
-            "file": fname,
-            "test": tname,
-            "status": status,
-            "message": message,
-            "suite_name": sname,
-        }
+        {"file": fname, "test": tname, "status": status, "message": message}
     )
 
     # There are sometimes duplicate tests in the report for some unknown reason.
@@ -309,102 +287,126 @@ def dataframe_from_jxml(run: Iterable) -> pandas.DataFrame:
         if len(group) > 1:
             if "message" in group.name:
                 return group.str.cat(sep="")
+            elif (group == "x").any(axis=0):
+                return "x"
             else:
-                if (group == "x").any(axis=0):
-                    return "x"
-                else:
-                    return group.iloc[0]
+                return group.iloc[0]
         else:
             return group
 
     return df.groupby(["file", "test"], as_index=False).agg(dedup)
 
 
-def download_and_parse_artifacts(
-    repo: str, branch: str, events: list[str], max_days: int, max_runs: int
-) -> Iterator[pandas.DataFrame]:
+def download_artifact(
+    a: dict, date: str, job_urls: dict[str, str], session: requests.Session
+) -> pandas.DataFrame | None:
+    """Download a single artifact, parse it, and reduce it to a dataframe holding
+    just the ``COLUMNS`` needed by the report. The raw download and parsed XML are
+    discarded immediately. Returns None if the artifact can't be used.
+    """
+    r = get_from_github(a["archive_download_url"], params={}, session=session)
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    try:
+        xml = junitparser.JUnitXml.fromstring(zf.read(zf.filelist[0].filename))
+    except Exception:
+        # e.g. truncated XML from a job that hit the timeout
+        return None
+
+    df = dataframe_from_jxml(cast(Iterable, xml))
+    if df.empty:
+        return None
+
+    html_url = job_urls.get(a["name"])
+    if html_url is None:
+        print(f"  WARNING: no job matches artifact {a['name']!r}; skipping")
+        return None
+
+    # Note: we tag every artifact with the workflow run timestamp rather than the
+    # artifact timestamp, so that artifacts of the same run align on the same
+    # trigger time.
+    return df.assign(suite=suite_from_name(a["name"]), date=date, html_url=html_url)[
+        COLUMNS
+    ]
+
+
+def download_new_artifacts(
+    cache: dict[str, pandas.DataFrame],
+    repo: str,
+    branch: str,
+    events: list[str],
+    max_days: int,
+    max_runs: int,
+) -> None:
+    """Download into ``cache`` (in place) any artifact of the most recent
+    ``max_runs`` workflow runs that isn't already cached, keyed by its download url.
+    """
     print("Getting list of workflow runs...")
-    runs = []
     with get_session() as session:
-        for event in events:
-            runs += get_workflow_run_listing(
-                repo=repo, branch=branch, event=event, days=max_days, session=session
-            )
-
-        # Filter the workflow runs listing to be in the retention period,
-        # and only be test runs (i.e., no linting) that completed.
-        runs = [
-            r
-            for r in runs
-            if (
-                pandas.to_datetime(r["created_at"])
-                > pandas.Timestamp.now(tz="UTC") - pandas.Timedelta(days=max_days)
-                and pandas.to_datetime(r["created_at"]) >= CUTOFF
-                and r["status"] == "completed"
-                and r["conclusion"] != "cancelled"
-                and r["name"].lower() == "tests"
-            )
-        ]
-        print(f"Found {len(runs)} workflow runs")
-        # Each workflow run processed takes ~10-15 API requests. To avoid being
-        # rate limited by GitHub (1000 requests per hour) we choose just the
-        # most recent N runs. This also keeps the viz size from blowing up.
+        runs = get_test_runs(repo, branch, events, max_days, session)
         runs = sorted(runs, key=lambda r: r["created_at"])[-max_runs:]
-        print(
-            f"Fetching artifact listing for the {len(runs)} most recent workflow runs"
-        )
+        print(f"Fetching artifacts for the {len(runs)} most recent workflow runs")
 
-        for r in runs:
-            artifacts = get_artifacts_for_workflow_run(
-                r["id"], repo=repo, session=session
-            )
-            # Skip artifacts that don't contain a JUnit XML report
-            r["artifacts"] = [
-                a
-                for a in artifacts
-                if not a["expired"]
-                and a["name"] != "Event File"
-                and "cluster_dumps" not in a["name"]
-            ]
-
-        nartifacts = sum(len(r["artifacts"]) for r in runs)
         ndownloaded = 0
-        print(f"Downloading and parsing {nartifacts} artifacts...")
-
-        for r in runs:
-            jobs_df = get_jobs(r, session=session, repo=repo)
-            r["dfs"] = []
-            for a in r["artifacts"]:
-                url = a["archive_download_url"]
-                df: pandas.DataFrame | None
-                xml = download_and_parse_artifact(url, repo=repo, session=session)
-                if xml is None:
-                    continue
-                df = dataframe_from_jxml(cast(Iterable, xml))
-
-                # Note: we assign a column with the workflow run timestamp rather
-                # than the artifact timestamp so that artifacts triggered under
-                # the same workflow run can be aligned according to the same trigger
-                # time.
-                html_url = jobs_df[jobs_df["suite_name"] == a["name"]].html_url.unique()
-                assert len(html_url) == 1, (
-                    f"Artifact suite name {a['name']} did not match any jobs dataframe:\n{jobs_df['suite_name'].unique()}"
-                )
-                html_url = html_url[0]
-                assert html_url is not None
-                df2 = df.assign(
-                    name=a["name"],
-                    suite=suite_from_name(a["name"]),
-                    date=r["created_at"],
-                    html_url=html_url,
-                )
-
-                if df2 is not None:
-                    yield df2
-
+        for run in runs:
+            new = [
+                a
+                for a in get_artifacts(run["id"], repo, session)
+                if a["archive_download_url"] not in cache
+            ]
+            if not new:
+                continue
+            # Only fetch the jobs listing for runs that have something to download
+            job_urls = get_job_urls(run, session)
+            for a in new:
+                df = download_artifact(a, run["created_at"], job_urls, session)
+                if df is not None:
+                    cache[a["archive_download_url"]] = df
                 ndownloaded += 1
-                if ndownloaded and not ndownloaded % 20:
-                    print(f"{ndownloaded}... ", end="", flush=True)
+                if ndownloaded % 100 == 0:
+                    print(f"{ndownloaded} downloaded...", flush=True)
+
+    print(f"Downloaded {ndownloaded} new artifacts ({len(cache)} in cache)")
+
+
+def load_cache(path: str) -> dict[str, pandas.DataFrame]:
+    """Load the whole cache from ``path``, or start fresh if it's missing or
+    unreadable (e.g. after a format change).
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            cache = pickle.load(f)
+        assert isinstance(cache, dict)
+    except Exception as e:
+        print(f"Could not load cache {path} ({e!r}); starting fresh")
+        return {}
+    print(f"Loaded {len(cache)} artifacts from {path}")
+    return cache
+
+
+def dump_cache(path: str, cache: dict[str, pandas.DataFrame]) -> None:
+    """Atomically write the whole cache to ``path``."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+    print(f"Saved {len(cache)} artifacts to {path}")
+
+
+def prune_cache(cache: dict[str, pandas.DataFrame], max_days: int) -> None:
+    """Drop from ``cache`` (in place) every artifact older than the retention
+    window (``max_days`` ago, but never earlier than ``CUTOFF``).
+    """
+    since = max(
+        pandas.Timestamp.now(tz="UTC") - pandas.Timedelta(days=max_days), CUTOFF
+    )
+    stale = [
+        url for url, df in cache.items() if pandas.to_datetime(df.date.iloc[0]) < since
+    ]
+    for url in stale:
+        del cache[url]
+    print(f"Pruned {len(stale)} artifacts older than {since.date()}")
 
 
 def make_chart(name, df, times):
@@ -445,41 +447,39 @@ def make_chart(name, df, times):
     )
 
 
-def main(argv: list[str] | None = None) -> None:
-    global TOKEN
+def build_report(
+    cache: dict[str, pandas.DataFrame],
+    repo: str,
+    title: str,
+    output: str,
+    max_days: int,
+    max_runs: int,
+    nfails: int,
+    argv: list[str] | None,
+) -> None:
+    since = max(
+        pandas.Timestamp.now(tz="UTC") - pandas.Timedelta(days=max_days), CUTOFF
+    )
+    dfs = [df for df in cache.values() if pandas.to_datetime(df.date.iloc[0]) >= since]
+    if not dfs:
+        print("Nothing to report")
+        with open(output, "w") as f:
+            f.write(f"<html><body><h1>{repo} {title}</h1><p>No data</p></body></html>")
+        return
 
-    args = parse_args(argv)
-    TOKEN = get_token()
+    total = pandas.concat(dfs, axis=0, ignore_index=True)
+    # Keep only the most recent `max_runs` workflow runs (one per trigger time)
+    keep_dates = sorted(total.date.unique())[-max_runs:]
+    total = total[total.date.isin(keep_dates)]
 
     # Note: we drop **all** tests which did not have at least <nfails> failures.
     # This is because, as nice as a block of green tests can be, there are
     # far too many tests to visualize at once, so we only want to look at
     # flaky tests. If the test suite has been doing well, this chart should
     # dwindle to nothing!
-    dfs = list(
-        download_and_parse_artifacts(
-            repo=args.repo,
-            branch=args.branch,
-            events=args.events,
-            max_days=args.max_days,
-            max_runs=args.max_runs,
-        )
-    )
-    total = pandas.concat(dfs, axis=0)
-    # Reduce the size of the DF since the entire thing is encoded in the vega spec
-    required_columns = [
-        "test",
-        "date",
-        "suite",
-        "file",
-        "html_url",
-        "status",
-        "message",
-    ]
-    total = total[required_columns]
     grouped = (
         total.groupby([total.file, total.test])
-        .filter(lambda g: (g.status == "x").sum() >= args.nfails)
+        .filter(lambda g: (g.status == "x").sum() >= nfails)
         .reset_index()
         .assign(test=lambda df: df.file.str.cat(df.test, sep="."))
         .groupby("test")
@@ -495,21 +495,29 @@ def main(argv: list[str] | None = None) -> None:
     print("Making chart...")
     altair.data_transformers.disable_max_rows()
 
-    jobs = []
     with ProcessPoolExecutor() as executor:
-        for name, df in overall.items():
-            # Don't show this suite if it has passed all tests recently.
-            if not len(df):
-                continue
-            jobs.append(executor.submit(make_chart, name, df, times))
+        jobs = [
+            executor.submit(make_chart, name, df, times)
+            for name, df in overall.items()
+            if len(df)
+        ]
         charts = [job.result() for job in jobs]
+
+    if not charts:
+        print("No flaky tests!")
+        with open(output, "w") as f:
+            f.write(
+                f"<html><body><h1>{repo} {title}</h1>"
+                "<p>No flaky tests 🎉</p></body></html>"
+            )
+        return
 
     # Concat the sub-charts and output to file
     chart = (
         altair.vconcat(*charts)
         .properties(
             title={
-                "text": [f"{args.repo} {args.title}"],
+                "text": [f"{repo} {title}"],
                 "subtitle": [" ".join(argv if argv is not None else sys.argv)],
             }
         )
@@ -522,11 +530,44 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     chart.save(
-        args.output,
+        output,
         embed_options={
             "renderer": "svg",  # Makes the text searchable
             "loader": {"target": "_blank"},  # Open hrefs in a new window
         },
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    global TOKEN
+
+    args = parse_args(argv)
+    path = cache_name(args.repo)
+    cache = load_cache(path)
+
+    if not args.report_only:
+        TOKEN = get_token()
+        download_new_artifacts(
+            cache,
+            repo=args.repo,
+            branch=args.branch,
+            events=args.events,
+            max_days=args.max_days,
+            max_runs=args.max_runs,
+        )
+        if args.prune_db:
+            prune_cache(cache, args.max_days)
+        dump_cache(path, cache)
+
+    build_report(
+        cache,
+        repo=args.repo,
+        title=args.title,
+        output=args.output,
+        max_days=args.max_days,
+        max_runs=args.max_runs,
+        nfails=args.nfails,
+        argv=argv,
     )
 
 
